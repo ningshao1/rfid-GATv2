@@ -1,0 +1,17 @@
+[style]
+based_on_style = google
+column_limit = 88
+indent_width = 4
+continuation_indent_width = 4
+use_tabs = False
+split_before_logical_operator = True
+split_before_bitwise_operator = True
+split_before_closing_bracket = True
+allow_split_before_dict_value = False
+coalesce_brackets = True
+dedent_closing_brackets = True
+each_dict_entry_on_separate_line = True
+spaces_before_comment = 2
+space_between_ending_comma_and_closing_bracket = False
+split_arguments_when_comma_terminated = True
+blank_line_before_nested_class_or_def = True

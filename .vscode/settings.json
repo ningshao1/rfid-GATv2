@@ -1,0 +1,13 @@
+{
+  "python.formatting.provider": "yapf",
+  "python.formatting.yapfArgs": [
+    "--style",
+    "{based_on_style: google, indent_width: 4, column_limit: 100, allow_split_before_dict_value: true, join_multiple_lines: false, space_before_comment: 2, split_before_logical_operator: true, split_before_bitwise_operator: true, split_before_arithmetic_operator: true, split_before_closing_bracket: true, split_before_dot: true, split_before_else: true, split_before_final_paren: true, split_before_first_argument: true, split_before_if_expression: true, split_before_logical_operator: true, split_before_named_assigns: true, split_before_open_bracket: true, split_before_operator: true, split_before_trailing_comma: true, split_penalty_after_opening_bracket: 300, split_penalty_after_unary_operator: 300, split_penalty_before_bitwise_operator: 300, split_penalty_before_if_expression: 300, split_penalty_excess_character: 7000, split_penalty_for_closing_bracket: 300, split_penalty_for_extra_line: 300, split_penalty_for_ignored_split: 300, split_penalty_for_implicit_string_concatenation: 300, split_penalty_for_operator: 300, split_penalty_for_terminator: 300, split_penalty_import_names: 300, split_penalty_logical_operator: 300, split_penalty_named_assigns: 300, split_penalty_unnamed_assigns: 300, split_penalty_after_opening_bracket: 300, split_penalty_after_unary_operator: 300, split_penalty_before_bitwise_operator: 300, split_penalty_before_if_expression: 300, split_penalty_excess_character: 7000, split_penalty_for_closing_bracket: 300, split_penalty_for_extra_line: 300, split_penalty_for_ignored_split: 300, split_penalty_for_implicit_string_concatenation: 300, split_penalty_for_operator: 300, split_penalty_for_terminator: 300, split_penalty_import_names: 300, split_penalty_logical_operator: 300, split_penalty_named_assigns: 300, split_penalty_unnamed_assigns: 300}"
+  ],
+  "editor.formatOnSave": true,
+  "editor.rulers": [100],
+  "editor.tabSize": 4,
+  "editor.insertSpaces": true,
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true
+}
