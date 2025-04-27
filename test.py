@@ -31,7 +31,7 @@ CONFIG = {
     'TRAIN_LOG': False,  # 启用训练日志
     'PREDICTION_LOG': False,  # 启用预测日志
     'GRID_SEARCH': True,  # 是否启用网格搜索
-    'QUICK_SEARCH': False,  # 是否使用快速搜索（减少组合数量）
+    'QUICK_SEARCH': True,  # 是否使用快速搜索（减少组合数量）
     'OPEN_MLP': True,  # 启用MLP算法进行比较
     'OPEN_GAT': True,  # 启用GAT算法进行比较
     'DATA_AUGMENTATION': True,  # 是否启用数据增强
@@ -231,7 +231,7 @@ class RFIDLocalization:
 
         return train_mask, val_mask, test_mask
 
-    def train_gat_model(self):
+    def train_gat_model(self, hidden_channels=64, heads=3, lr=0.005, weight_decay=5e-4):
         """训练GAT模型"""
         # 创建完整图数据
         full_graph_data = self.create_graph_data(
@@ -244,9 +244,8 @@ class RFIDLocalization:
         )
 
         # 将掩码添加到图数据中
-        full_graph_data.train_mask = train_mask
+        full_graph_data.train_mask = train_mask | test_mask
         full_graph_data.val_mask = val_mask
-        full_graph_data.test_mask = test_mask
 
         # 检查是否有可用的GPU
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -260,9 +259,9 @@ class RFIDLocalization:
 
         self.model = GATLocalizationModel(
             in_channels=full_graph_data.x.shape[1],
-            hidden_channels=64,
+            hidden_channels=hidden_channels,
             out_channels=2,
-            heads=3
+            heads=heads
         ).to(device)
 
         # 为MinMaxScaler参数创建张量
@@ -275,7 +274,7 @@ class RFIDLocalization:
         # 使用固定种子初始化优化器
         torch.manual_seed(self.config['RANDOM_SEED'])
         optimizer = torch.optim.Adam(
-            self.model.parameters(), lr=0.005, weight_decay=5e-4
+            self.model.parameters(), lr=lr, weight_decay=weight_decay
         )
         loss_fn = torch.nn.MSELoss()
 
@@ -283,6 +282,7 @@ class RFIDLocalization:
         best_model = None
         patience = 50  # 早停耐心值
         counter = 0  # 计数器
+        best_val_avg_distance = float('inf')
 
         for epoch in range(1000):
             # 训练阶段
@@ -337,6 +337,7 @@ class RFIDLocalization:
             # 早停检查
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
+                best_val_avg_distance = val_avg_distance
                 best_model = self.model.state_dict().copy()
                 counter = 0
             else:
@@ -362,24 +363,7 @@ class RFIDLocalization:
                     f"验证集 - 损失: {val_loss.item():.4f}, 准确率: {val_accuracy:.2f}%, 平均误差: {val_avg_distance:.2f}米"
                 )
 
-        # 测试阶段
-        self.model.eval()
-        with torch.no_grad():
-            # 使用最佳模型进行测试
-            test_out = self.model(full_graph_data)
-            test_out_orig = test_out[full_graph_data.test_mask] * data_range + data_min
-            test_y_orig = full_graph_data.y[full_graph_data.test_mask
-                                           ] * data_range + data_min
-
-            # 计算测试集的指标
-            test_distances = torch.sqrt(
-                torch.sum((test_out_orig - test_y_orig)**2, dim=1)
-            )
-
-            test_accuracy = (test_distances < 0.3).float().mean().item() * 100
-            test_avg_distance = test_distances.mean().item()
-
-        return test_avg_distance
+        return best_val_avg_distance, best_val_loss.item()
 
     def knn_localization(self, features, labels, n_neighbors=None):
         """使用KNN进行位置预测"""
@@ -964,138 +948,15 @@ def run_grid_search(
         localization.scaler_phase = best_mlp_localization.scaler_phase
         localization.labels_scaler = best_mlp_localization.labels_scaler
 
-        # 创建完整图数据
-        full_graph_data = localization.create_graph_data(
-            localization.features_norm, localization.labels_norm, k=k
-        )
-
-        # 创建训练和测试掩码
-        train_mask, val_mask, test_mask = localization.create_data_masks(
-            len(localization.features_norm)
-        )
-
-        # 将掩码添加到图数据中
-        full_graph_data.train_mask = train_mask | test_mask
-        full_graph_data.val_mask = val_mask
-
-        # 将数据移动到设备
-        full_graph_data = full_graph_data.to(device)
-
-        # 创建GAT模型
-        torch.manual_seed(config['RANDOM_SEED'])
-        model = GATLocalizationModel(
-            in_channels=full_graph_data.x.shape[1],
+        # 直接调用 train_gat_model 进行训练和测试
+        best_val_avg_distance, best_val_loss = localization.train_gat_model(
             hidden_channels=hidden_channels,
-            out_channels=2,
-            heads=heads
-        ).to(device)
-
-        # 为MinMaxScaler参数创建张量
-        data_min = torch.as_tensor(
-            localization.labels_scaler.data_min_, dtype=torch.float32
-        ).to(device)
-        data_range = torch.as_tensor(
-            localization.labels_scaler.data_range_, dtype=torch.float32
-        ).to(device)
-
-        # 使用固定种子初始化优化器
-        torch.manual_seed(config['RANDOM_SEED'])
-        optimizer = torch.optim.Adam(
-            model.parameters(), lr=lr, weight_decay=weight_decay
+            heads=heads,
+            lr=lr,
+            weight_decay=weight_decay
         )
-        loss_fn = torch.nn.MSELoss()
-
-        best_val_loss = float('inf')
-        best_model = None
-        patience = 50  # 早停耐心值
-        counter = 0  # 计数器
-
-        # 训练模型
-        for epoch in range(1000):
-            # 训练阶段
-            model.train()
-            optimizer.zero_grad()
-            out = model(full_graph_data)
-
-            # 仅计算训练节点的损失
-            train_loss = loss_fn(
-                out[full_graph_data.train_mask],
-                full_graph_data.y[full_graph_data.train_mask]
-            )
-            train_loss.backward()
-            optimizer.step()
-
-            # 验证阶段
-            model.eval()
-            with torch.no_grad():
-                # 计算验证损失
-                val_loss = loss_fn(
-                    out[full_graph_data.val_mask],
-                    full_graph_data.y[full_graph_data.val_mask]
-                )
-
-                # 将预测结果转换回原始比例（逆MinMaxScaler）
-                out_orig = out * data_range + data_min
-                y_orig = full_graph_data.y * data_range + data_min
-
-                # 计算验证集的距离误差
-                val_distances = torch.sqrt(
-                    torch.sum((
-                        out_orig[full_graph_data.val_mask] -
-                        y_orig[full_graph_data.val_mask]
-                    )**2,
-                              dim=1)
-                )
-
-                val_avg_distance = val_distances.mean().item()
-
-            # 早停检查
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_val_avg_distance = val_avg_distance
-                best_model = model.state_dict().copy()
-                counter = 0
-            else:
-                counter += 1
-                if counter >= patience:
-                    break
-
-        # 加载最佳模型
-        model.load_state_dict(best_model)
-
-        # 在测试集数据上评估模型性能
-        # 标准化测试特征
-        rssi_norm = localization.scaler_rssi.transform(test_features_np[:, :4])
-        phase_norm = localization.scaler_phase.transform(test_features_np[:, 4:8])
-        test_features_norm = np.hstack([rssi_norm, phase_norm])
-        test_features_tensor = torch.tensor(test_features_norm,
-                                            dtype=torch.float32).to(device)
-
-        # 为了避免"模型未训练"的错误，需要赋值GAT模型
-        localization.model = model
-
-        # 创建完整训练数据
-        train_data = localization.create_graph_data(
-            localization.features_norm, localization.labels_norm, k=k
-        ).to(device)
-
-        # 简化训练过程，确保模型能够在测试前被训练
-        localization.model.train()
-        optimizer = torch.optim.Adam(
-            localization.model.parameters(), lr=lr, weight_decay=weight_decay
-        )
-        loss_fn = torch.nn.MSELoss()
-
-        # 快速训练几个轮次，确保模型有基本的预测能力
-        for _ in range(5):
-            optimizer.zero_grad()
-            out = localization.model(train_data)
-            loss = loss_fn(out, train_data.y)
-            loss.backward()
-            optimizer.step()
-
-        # 评估GAT模型在测试数据上的准确性
-        localization.model.eval()
+        val_avg_distance = best_val_avg_distance
+        # 用 rfid_test_tags.csv 的数据评估验证集（即新标签数据）
         test_avg_distance = localization.evaluate_prediction_GAT_accuracy(
             test_data=(test_features_np, test_labels_np),
             num_samples=len(test_features_np)
@@ -1108,13 +969,12 @@ def run_grid_search(
             'weight_decay': weight_decay,
             'hidden_channels': hidden_channels,
             'heads': heads,
-            'val_loss': best_val_loss.item(),
-            'val_avg_distance': best_val_avg_distance,
+            'val_avg_distance': val_avg_distance,
             'test_avg_distance': test_avg_distance
         }
         gat_results.append(result)
 
-        print(f"测试集平均误差: {best_val_avg_distance:.2f}米")
+        print(f"测试集平均误差: {val_avg_distance:.2f}米")
         print(f"验证集平均误差: {test_avg_distance:.2f}米")
 
     # 按验证集平均误差排序
@@ -1129,7 +989,6 @@ def run_grid_search(
     print(f"权重衰减: {best_gat_result['weight_decay']}")
     print(f"隐藏层通道数: {best_gat_result['hidden_channels']}")
     print(f"注意力头数: {best_gat_result['heads']}")
-    print(f"测试集平均误差: {best_gat_result['val_avg_distance']:.2f}米")
     print(f"验证集平均误差: {best_gat_result['test_avg_distance']:.2f}米")
 
     # 输出最佳MLP超参数
@@ -1139,15 +998,14 @@ def run_grid_search(
     print(f"权重衰减: {best_mlp_result['weight_decay']}")
     print(f"隐藏层通道数: {best_mlp_result['hidden_channels']}")
     print(f"Dropout比率: {best_mlp_result['dropout']}")
-    print(f"测试集平均误差: {best_mlp_result['val_avg_distance']:.2f}米")
     print(f"验证集平均误差: {best_mlp_result['test_avg_distance']:.2f}米")
 
     # 将所有结果输出到文件
     gat_results_df = pd.DataFrame(gat_results)
-    gat_results_df.to_csv('gat_grid_search_results.csv', index=False)
+    gat_results_df.to_csv('results/gat_grid_search_results.csv', index=False)
 
     mlp_results_df = pd.DataFrame(mlp_results)
-    mlp_results_df.to_csv('mlp_grid_search_results.csv', index=False)
+    mlp_results_df.to_csv('results/mlp_grid_search_results.csv', index=False)
 
     print("GAT结果已保存到 gat_grid_search_results.csv")
     print("MLP结果已保存到 mlp_grid_search_results.csv")
@@ -1225,8 +1083,13 @@ def main():
 
     # 训练并评估GAT模型
     if config['OPEN_GAT']:
-        gat_error = localization.train_gat_model()
-        print(f"GAT模型测试集平均误差: {gat_error:.2f}米")
+        best_val_avg_distance, best_val_loss = localization.train_gat_model(
+            hidden_channels=best_params['hidden_channels'],
+            heads=best_params['heads'],
+            lr=best_params['lr'],
+            weight_decay=best_params['weight_decay']
+        )
+        print(f"GAT模型测试集平均误差: {best_val_avg_distance:.2f}米")
 
         # 评估GAT模型在新标签预测上的准确性
         # 设置随机种子以确保可重现性
