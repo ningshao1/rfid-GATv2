@@ -30,11 +30,11 @@ CONFIG = {
     'OPEN_KNN': True,  # 启用KNN算法进行比较
     'TRAIN_LOG': False,  # 启用训练日志
     'PREDICTION_LOG': False,  # 启用预测日志
-    'GRID_SEARCH': True,  # 是否启用网格搜索
+    'GRID_SEARCH': False,  # 是否启用网格搜索
     'QUICK_SEARCH': True,  # 是否使用快速搜索（减少组合数量）
     'OPEN_MLP': True,  # 启用MLP算法进行比较
     'OPEN_GAT': True,  # 启用GAT算法进行比较
-    'DATA_AUGMENTATION': True,  # 是否启用数据增强
+    'DATA_AUGMENTATION': False,  # 是否启用数据增强
     'OPEN_LANDMARC': True,  # 启用LANDMARC算法进行比较
 }
 
@@ -86,6 +86,15 @@ class GATLocalizationModel(torch.nn.Module):
             edge_dim=1
         )
 
+        # 残差连接的线性变换（如果需要）
+        if in_channels != hidden_channels * heads:
+            self.res_fc1 = torch.nn.Linear(in_channels, hidden_channels * heads)
+        else:
+            self.res_fc1 = None
+        # 第二个残差连接（gat2前后）
+        # gat2输入输出维度都是hidden_channels * heads
+        self.res_fc2 = None  # 预留接口，便于后续扩展
+
         self.fc = torch.nn.Sequential(
             torch.nn.Linear(hidden_channels * heads, hidden_channels), torch.nn.ReLU(),
             torch.nn.Linear(hidden_channels, 32), torch.nn.ReLU(),
@@ -99,10 +108,24 @@ class GATLocalizationModel(torch.nn.Module):
         if edge_attr is not None and edge_attr.dim() == 1:
             edge_attr = edge_attr.view(-1, 1)
 
+        x_input = x  # 保留输入用于残差
         x = self.gat1(x, edge_index, edge_attr=edge_attr)
-        x = F.elu(x)
+        # 第一处残差连接
+        if self.res_fc1 is not None:
+            res1 = self.res_fc1(x_input)
+        else:
+            res1 = x_input
+        x = F.elu(x + res1)
+
+        x_input2 = x  # 保留gat1输出用于第二处残差
         x = self.gat2(x, edge_index, edge_attr=edge_attr)
-        x = F.elu(x)
+        # 第二处残差连接
+        if self.res_fc2 is not None:
+            res2 = self.res_fc2(x_input2)
+        else:
+            res2 = x_input2
+        x = F.elu(x + res2)
+
         x = self.fc(x)
         return x
 
