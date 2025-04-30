@@ -217,13 +217,39 @@ class RFIDLocalization:
         if pos is None:
             pos = self.labels
 
+        # 添加天线节点
+        antenna_locations = torch.tensor([
+            [0.0, 0.0],  # 天线1 (0,0)
+            [0.0, 10.0],  # 天线2 (0,10)
+            [10.0, 0.0],  # 天线3 (10,0)
+            [10.0, 10.0]  # 天线4 (10,10)
+        ], dtype=torch.float32).to(self.device)
+
+        # 标准化天线位置
+        antenna_locations_norm = self.to_device(torch.tensor(
+            self.labels_scaler.transform(antenna_locations.cpu().numpy()),
+            dtype=torch.float32
+        ))
+
+        # 为天线节点创建特征，使用全-1值作为天线特征的标识
+        antenna_features = torch.full((4, features_norm.shape[1]), -1.0,
+                                      dtype=torch.float32).to(self.device)
+
+        # 合并标签节点和天线节点
+        all_features = torch.cat([features_norm, antenna_features], dim=0)
+        all_labels = torch.cat([labels_norm, antenna_locations_norm], dim=0)
+
+        # 保存天线在节点列表中的索引
+        antenna_indices = torch.arange(
+            len(features_norm), len(features_norm) + 4).to(self.device)
+
         # 使用标签（位置）构建KNN图
         adj_matrix = kneighbors_graph(
             torch.as_tensor(
                 np.hstack([
-                    0.3 * features_norm.cpu().numpy(),
+                    0.2 * all_features.cpu().numpy(),
                     # 0.6 * features_norm[:, 4:8].cpu().numpy(),
-                    0.7 * labels_norm.cpu().numpy()
+                    0.8 * all_labels.cpu().numpy()
                 ])
             ),
             n_neighbors=k,
@@ -237,12 +263,63 @@ class RFIDLocalization:
         edge_attr = self.to_device(torch.tensor(
             adj_matrix_coo.data, dtype=torch.float32))
 
+        # 添加每个标签节点到对应天线的边（使其始终连接）
+        additional_edges = []
+        additional_edge_attrs = []
+
+        # 为每个标签节点添加到各个天线的连接
+        for node_idx in range(len(features_norm)):
+            for ant_idx, antenna_idx in enumerate(antenna_indices):
+                # 计算标签节点到天线的欧氏距离（作为边属性）
+                # 同时考虑位置和特征信息，但分开计算避免维度不匹配
+                pos_dist = torch.sqrt(
+                    torch.sum((all_labels[node_idx] - all_labels[antenna_idx])**2))
+                # 特征距离只考虑标签节点的特征（天线节点的特征是-1）
+                # 将特征距离归一化到与位置距离相似的范围
+                feat_weight = 0.3  # 特征权重
+                dist = (1-feat_weight)*pos_dist+feat_weight * \
+                    torch.norm(features_norm[node_idx])
+
+                # 添加双向边
+                additional_edges.append([node_idx, antenna_idx])
+                additional_edges.append([antenna_idx, node_idx])
+
+                additional_edge_attrs.append(dist)
+                additional_edge_attrs.append(dist)
+
+        # 将额外边和边属性转换为张量
+        if additional_edges:
+            additional_edges_tensor = self.to_device(
+                torch.tensor(additional_edges, dtype=torch.long).t())
+            additional_edge_attrs_tensor = self.to_device(
+                torch.tensor(additional_edge_attrs, dtype=torch.float32))
+
+            # 合并原始边和附加边
+            edge_index = torch.cat(
+                [edge_index, additional_edges_tensor], dim=1)
+            edge_attr = torch.cat([edge_attr, additional_edge_attrs_tensor])
+
+        # 更新位置字典，加入天线位置
+        if isinstance(pos, torch.Tensor):
+            # 确保设备一致
+            antenna_positions = antenna_locations
+            if pos.device != antenna_positions.device:
+                # 将两者都移动到同一设备
+                pos = pos.to(self.device)
+                antenna_positions = antenna_positions.to(self.device)
+            all_pos = torch.cat([pos, antenna_positions], dim=0)
+        else:  # 如果pos是字典
+            all_pos = pos.copy() if hasattr(pos, 'copy') else dict(pos)
+            for i, antenna_idx in enumerate(antenna_indices):
+                all_pos[antenna_idx.item()] = (
+                    antenna_locations[i][0].item(), antenna_locations[i][1].item())
+
         return Data(
-            x=self.to_device(features_norm),
+            x=self.to_device(all_features),
             edge_index=edge_index,
             edge_attr=edge_attr,
-            y=self.to_device(labels_norm),
-            pos=pos
+            y=self.to_device(all_labels),
+            pos=all_pos
         )
 
     def create_data_masks(self, num_nodes, test_size=0.2, val_size=0.2):
@@ -280,14 +357,27 @@ class RFIDLocalization:
             self.features_norm, self.labels_norm, k=self.config['K']
         )
 
+        # 计算添加天线后的节点总数
+        total_nodes = len(self.features_norm) + 4  # 原始节点 + 4个天线节点
+
         # 创建训练、验证和测试掩码
         train_mask, val_mask, test_mask = self.create_data_masks(
-            len(self.features_norm)
+            len(self.features_norm)  # 只针对原始节点创建掩码
         )
 
+        # 将掩码扩展以包含天线节点（天线节点不参与训练）
+        extended_train_mask = self.to_device(
+            torch.zeros(total_nodes, dtype=torch.bool))
+        extended_val_mask = self.to_device(
+            torch.zeros(total_nodes, dtype=torch.bool))
+
+        # 复制原始掩码到扩展掩码的前部分
+        extended_train_mask[:len(train_mask)] = train_mask
+        extended_val_mask[:len(val_mask)] = val_mask
+
         # 将掩码添加到图数据中
-        full_graph_data.train_mask = train_mask | test_mask
-        full_graph_data.val_mask = val_mask
+        full_graph_data.train_mask = extended_train_mask
+        full_graph_data.val_mask = extended_val_mask
 
         # 将数据移动到设备
         full_graph_data = full_graph_data.to(device)
@@ -355,29 +445,42 @@ class RFIDLocalization:
                 y_orig = full_graph_data.y * data_range + data_min
 
                 # 计算训练集和验证集的指标（使用原始坐标）
-                train_distances = torch.sqrt(
-                    torch.sum((
-                        out_orig[full_graph_data.train_mask] -
-                        y_orig[full_graph_data.train_mask]
-                    )**2,
-                        dim=1)
-                )
+                # 只考虑非天线节点的性能
+                original_nodes_mask = torch.zeros(
+                    total_nodes, dtype=torch.bool, device=device)
+                original_nodes_mask[:len(self.features_norm)] = True
 
-                val_distances = torch.sqrt(
-                    torch.sum((
-                        out_orig[full_graph_data.val_mask] -
-                        y_orig[full_graph_data.val_mask]
-                    )**2,
-                        dim=1)
-                )
+                # 获取训练和验证节点中的非天线节点
+                train_mask_orig = full_graph_data.train_mask & original_nodes_mask
+                val_mask_orig = full_graph_data.val_mask & original_nodes_mask
 
-                train_accuracy = (train_distances <
-                                  0.3).float().mean().item() * 100
-                val_accuracy = (
-                    val_distances < 0.3).float().mean().item() * 100
+                if train_mask_orig.sum() > 0:
+                    train_distances = torch.sqrt(
+                        torch.sum((
+                            out_orig[train_mask_orig] -
+                            y_orig[train_mask_orig]
+                        )**2, dim=1)
+                    )
+                    train_accuracy = (train_distances <
+                                      0.3).float().mean().item() * 100
+                    train_avg_distance = train_distances.mean().item()
+                else:
+                    train_accuracy = 0
+                    train_avg_distance = 0
 
-                train_avg_distance = train_distances.mean().item()
-                val_avg_distance = val_distances.mean().item()
+                if val_mask_orig.sum() > 0:
+                    val_distances = torch.sqrt(
+                        torch.sum((
+                            out_orig[val_mask_orig] -
+                            y_orig[val_mask_orig]
+                        )**2, dim=1)
+                    )
+                    val_accuracy = (
+                        val_distances < 0.3).float().mean().item() * 100
+                    val_avg_distance = val_distances.mean().item()
+                else:
+                    val_accuracy = 0
+                    val_avg_distance = float('inf')
 
             # 保存每个epoch的损失值
             self.gat_train_losses.append(train_loss.item())
@@ -418,6 +521,12 @@ class RFIDLocalization:
         """使用KNN进行位置预测"""
         if n_neighbors is None:
             n_neighbors = self.config['K']
+
+        # 确保数据是numpy数组格式
+        if isinstance(features, torch.Tensor):
+            features = features.cpu().numpy()
+        if isinstance(labels, torch.Tensor):
+            labels = labels.cpu().numpy()
 
         # 创建并训练KNN模型
         knn = KNeighborsRegressor(n_neighbors=n_neighbors, algorithm='auto')
@@ -488,7 +597,7 @@ class RFIDLocalization:
             # 提取单个样本特征
             sample_features = features_new[i:i + 1]
 
-            # 使用KNN估计初始位置
+            # 使用MLP估计初始位置
             self.mlp_model.eval()
             with torch.no_grad():
                 mlp_pred = self.mlp_model(sample_features)
@@ -500,13 +609,13 @@ class RFIDLocalization:
                 sample_features
             ], dim=0)
 
-            # 为新节点使用KNN估计的标签
+            # 为新节点使用MLP估计的标签
             all_labels = torch.cat([
                 self.labels_norm,
                 temp_labels
             ], dim=0)
 
-            # 创建图数据
+            # 创建图数据（会自动添加天线节点）
             graph_data = self.create_graph_data(
                 all_features, all_labels, k=self.config['K'], pos=self.labels
             )
@@ -515,8 +624,10 @@ class RFIDLocalization:
             self.model.eval()
             with torch.no_grad():
                 out = self.model(graph_data)
-                # 提取新节点预测
-                pred_pos = out[-1]
+                # 获取新样本节点预测 - 它在原始节点之后，但在天线节点之前
+                # 新样本节点的索引就是原始节点数量的位置
+                pred_idx = len(self.features_norm)
+                pred_pos = out[pred_idx]
                 predicted_positions.append(pred_pos)
 
         # 计算误差
@@ -1226,7 +1337,8 @@ def main():
         # 设置随机种子以确保可重现性
         np.random.seed(config['RANDOM_SEED'] + 1)  # 使用不同的种子以避免与训练集重叠
         gat_prediction_error = localization.evaluate_prediction_GAT_accuracy(
-            test_data=(test_features_np, test_labels_np), num_samples=50
+            test_data=(test_features_np, test_labels_np),
+            num_samples=len(test_features_np)  # 使用所有测试数据
         )
         print(f"GAT模型在新标签上的平均预测误差: {gat_prediction_error:.2f}米")
 
