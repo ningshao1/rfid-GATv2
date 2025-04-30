@@ -18,6 +18,7 @@ from torch_geometric.utils import from_scipy_sparse_matrix, to_undirected
 from torch_geometric.nn import GATv2Conv
 import itertools
 import time
+import os
 
 # 忽略警告
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -25,18 +26,21 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 # 配置
 CONFIG = {
-    'K': 5,  # KNN的K值
+    'K': 7,  # KNN的K值
     'RANDOM_SEED': 32,  # 随机种子
     'OPEN_KNN': True,  # 启用KNN算法进行比较
     'TRAIN_LOG': False,  # 启用训练日志
     'PREDICTION_LOG': False,  # 启用预测日志
     'GRID_SEARCH': False,  # 是否启用网格搜索
-    'QUICK_SEARCH': True,  # 是否使用快速搜索（减少组合数量）
+    'QUICK_SEARCH': False,  # 是否使用快速搜索（减少组合数量）
     'OPEN_MLP': True,  # 启用MLP算法进行比较
     'OPEN_GAT': True,  # 启用GAT算法进行比较
     'DATA_AUGMENTATION': False,  # 是否启用数据增强
     'OPEN_LANDMARC': True,  # 启用LANDMARC算法进行比较
 }
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print("device:", device)
 
 # 设置matplotlib参数以支持中文字符
 plt.rcParams['font.sans-serif'] = ['SimHei']
@@ -88,7 +92,8 @@ class GATLocalizationModel(torch.nn.Module):
 
         # 残差连接的线性变换（如果需要）
         if in_channels != hidden_channels * heads:
-            self.res_fc1 = torch.nn.Linear(in_channels, hidden_channels * heads)
+            self.res_fc1 = torch.nn.Linear(
+                in_channels, hidden_channels * heads)
         else:
             self.res_fc1 = None
         # 第二个残差连接（gat2前后）
@@ -96,7 +101,8 @@ class GATLocalizationModel(torch.nn.Module):
         self.res_fc2 = None  # 预留接口，便于后续扩展
 
         self.fc = torch.nn.Sequential(
-            torch.nn.Linear(hidden_channels * heads, hidden_channels), torch.nn.ReLU(),
+            torch.nn.Linear(hidden_channels * heads,
+                            hidden_channels), torch.nn.ReLU(),
             torch.nn.Linear(hidden_channels, 32), torch.nn.ReLU(),
             torch.nn.Linear(32, out_channels)
         )
@@ -136,6 +142,8 @@ class RFIDLocalization:
     def __init__(self, config=None):
         """使用配置进行初始化"""
         self.config = config or CONFIG
+        self.device = torch.device(
+            'cuda' if torch.cuda.is_available() else 'cpu')
         self.set_random_seed()
 
         # 数据占位符
@@ -151,6 +159,12 @@ class RFIDLocalization:
         self.model = None
         self.mlp_model = None
 
+        # 添加损失值记录
+        self.gat_train_losses = []
+        self.gat_val_losses = []
+        self.mlp_train_losses = []
+        self.mlp_val_losses = []
+
         # 加载数据
         self.load_data()
 
@@ -165,29 +179,30 @@ class RFIDLocalization:
         self.df = pd.read_csv('data/rfid_reference_tags.csv')
 
         # 提取特征和标签
-        self.features = torch.tensor(
+        self.features = self.to_device(torch.tensor(
             self.df[[
                 'rssi_antenna1', 'rssi_antenna2', 'rssi_antenna3', 'rssi_antenna4',
                 "phase_antenna1", "phase_antenna2", "phase_antenna3", "phase_antenna4"
             ]].values,
             dtype=torch.float32
-        )
-        self.labels = torch.tensor(
+        ))
+        self.labels = self.to_device(torch.tensor(
             self.df[['true_x', 'true_y']].values, dtype=torch.float32
-        )
+        ))
 
         # 标准化特征
-        rssi_norm = self.scaler_rssi.fit_transform(self.features[:, :4])
-        phase = self.features[:, 4:8]
+        rssi_norm = self.scaler_rssi.fit_transform(
+            self.features[:, :4].cpu().numpy())
+        phase = self.features[:, 4:8].cpu().numpy()
         phase_norm = self.scaler_phase.fit_transform(phase)
-        self.features_norm = torch.tensor(
+        self.features_norm = self.to_device(torch.tensor(
             np.hstack([rssi_norm, phase_norm]), dtype=torch.float32
-        )
+        ))
 
         # 标准化标签
-        self.labels_norm = torch.tensor(
-            self.labels_scaler.fit_transform(self.labels), dtype=torch.float32
-        )
+        self.labels_norm = self.to_device(torch.tensor(
+            self.labels_scaler.fit_transform(self.labels.cpu().numpy()), dtype=torch.float32
+        ))
 
         # 创建位置字典
         self.pos = {
@@ -206,23 +221,27 @@ class RFIDLocalization:
         adj_matrix = kneighbors_graph(
             torch.as_tensor(
                 np.hstack([
-                    0.2 * features_norm[:, 0:4], 0.6 * features_norm[:, 4:8],
-                    0.2 * labels_norm
+                    0.3 * features_norm.cpu().numpy(),
+                    # 0.6 * features_norm[:, 4:8].cpu().numpy(),
+                    0.7 * labels_norm.cpu().numpy()
                 ])
             ),
             n_neighbors=k,
             mode='distance',
         )
-        adj_matrix_dense = torch.as_tensor(adj_matrix.toarray(), dtype=torch.float32)
-        edge_index = torch.nonzero(adj_matrix_dense, as_tuple=False).t()
+        adj_matrix_dense = torch.as_tensor(
+            adj_matrix.toarray(), dtype=torch.float32)
+        edge_index = self.to_device(torch.nonzero(
+            adj_matrix_dense, as_tuple=False).t())
         adj_matrix_coo = adj_matrix.tocoo()
-        edge_attr = torch.tensor(adj_matrix_coo.data, dtype=torch.float32)
+        edge_attr = self.to_device(torch.tensor(
+            adj_matrix_coo.data, dtype=torch.float32))
 
         return Data(
-            x=features_norm,
+            x=self.to_device(features_norm),
             edge_index=edge_index,
             edge_attr=edge_attr,
-            y=labels_norm,
+            y=self.to_device(labels_norm),
             pos=pos
         )
 
@@ -244,9 +263,9 @@ class RFIDLocalization:
         )
 
         # 创建掩码
-        train_mask = torch.zeros(num_nodes, dtype=torch.bool)
-        val_mask = torch.zeros(num_nodes, dtype=torch.bool)
-        test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+        train_mask = self.to_device(torch.zeros(num_nodes, dtype=torch.bool))
+        val_mask = self.to_device(torch.zeros(num_nodes, dtype=torch.bool))
+        test_mask = self.to_device(torch.zeros(num_nodes, dtype=torch.bool))
 
         train_mask[train_idx] = True
         val_mask[val_idx] = True
@@ -269,9 +288,6 @@ class RFIDLocalization:
         # 将掩码添加到图数据中
         full_graph_data.train_mask = train_mask | test_mask
         full_graph_data.val_mask = val_mask
-
-        # 检查是否有可用的GPU
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # 将数据移动到设备
         full_graph_data = full_graph_data.to(device)
@@ -307,6 +323,10 @@ class RFIDLocalization:
         counter = 0  # 计数器
         best_val_avg_distance = float('inf')
 
+        # 清空损失记录
+        self.gat_train_losses = []
+        self.gat_val_losses = []
+
         for epoch in range(1000):
             # 训练阶段
             self.model.train()
@@ -340,7 +360,7 @@ class RFIDLocalization:
                         out_orig[full_graph_data.train_mask] -
                         y_orig[full_graph_data.train_mask]
                     )**2,
-                              dim=1)
+                        dim=1)
                 )
 
                 val_distances = torch.sqrt(
@@ -348,14 +368,20 @@ class RFIDLocalization:
                         out_orig[full_graph_data.val_mask] -
                         y_orig[full_graph_data.val_mask]
                     )**2,
-                              dim=1)
+                        dim=1)
                 )
 
-                train_accuracy = (train_distances < 0.3).float().mean().item() * 100
-                val_accuracy = (val_distances < 0.3).float().mean().item() * 100
+                train_accuracy = (train_distances <
+                                  0.3).float().mean().item() * 100
+                val_accuracy = (
+                    val_distances < 0.3).float().mean().item() * 100
 
                 train_avg_distance = train_distances.mean().item()
                 val_avg_distance = val_distances.mean().item()
+
+            # 保存每个epoch的损失值
+            self.gat_train_losses.append(train_loss.item())
+            self.gat_val_losses.append(val_loss.item())
 
             # 早停检查
             if val_loss < best_val_loss:
@@ -402,8 +428,10 @@ class RFIDLocalization:
     def evaluate_knn_on_test_set(self, knn_model, test_features, test_labels):
         """在测试集上评估KNN模型"""
         # 确保数据是numpy数组格式
-        test_features = np.array(test_features)
-        test_labels = np.array(test_labels)
+        if isinstance(test_features, torch.Tensor):
+            test_features = test_features.cpu().numpy()
+        if isinstance(test_labels, torch.Tensor):
+            test_labels = test_labels.cpu().numpy()
 
         # 预测测试集
         y_pred = knn_model.predict(test_features)
@@ -420,27 +448,33 @@ class RFIDLocalization:
         if self.model is None:
             raise ValueError("模型未训练。请先调用train_gat_model。")
 
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
         # 如果没有提供测试数据，则从现有数据中随机抽样
         if test_data is None:
             # 随机抽样
-            indices = np.random.choice(len(self.features), num_samples, replace=False)
-            test_features = self.features[indices].numpy()
-            test_labels = self.labels[indices].numpy()
+            indices = np.random.choice(
+                len(self.features), num_samples, replace=False)
+            test_features = self.features[indices]
+            test_labels = self.labels[indices]
         else:
             test_features, test_labels = test_data
+            test_features = self.to_device(
+                torch.tensor(test_features, dtype=torch.float32))
+            test_labels = self.to_device(
+                torch.tensor(test_labels, dtype=torch.float32))
 
         # 获取RSSI和相位值
         rssi_values = test_features[:, :4]
         phase_values = test_features[:, 4:8]
 
         # 标准化RSSI
-        rssi_norm = self.scaler_rssi.transform(rssi_values)
-        phase_norm = self.scaler_phase.transform(phase_values)
+        rssi_norm = self.scaler_rssi.transform(rssi_values.cpu().numpy())
+        phase_norm = self.scaler_phase.transform(phase_values.cpu().numpy())
 
         # 组合特征
-        features_new = np.hstack([rssi_norm, phase_norm])
+        features_new = self.to_device(torch.tensor(
+            np.hstack([rssi_norm, phase_norm]),
+            dtype=torch.float32
+        ))
 
         # 使用GAT模型预测
         predicted_positions = []
@@ -454,25 +488,23 @@ class RFIDLocalization:
             # 提取单个样本特征
             sample_features = features_new[i:i + 1]
 
-            # 转换为张量
-            features_tensor = torch.as_tensor(sample_features,
-                                              dtype=torch.float32).to(device)
-
             # 使用KNN估计初始位置
             self.mlp_model.eval()
             with torch.no_grad():
-                mlp_pred = self.mlp_model(features_tensor)
-            temp_labels = torch.as_tensor(mlp_pred, dtype=torch.float32).to(device)
+                mlp_pred = self.mlp_model(sample_features)
+            temp_labels = self.to_device(mlp_pred)
 
             # 将新节点添加到特征集
             all_features = torch.cat([
-                torch.as_tensor(self.features_norm, dtype=torch.float32),
-                features_tensor
-            ],
-                                     dim=0)
+                self.features_norm,
+                sample_features
+            ], dim=0)
 
             # 为新节点使用KNN估计的标签
-            all_labels = torch.cat([self.labels_norm, temp_labels], dim=0)
+            all_labels = torch.cat([
+                self.labels_norm,
+                temp_labels
+            ], dim=0)
 
             # 创建图数据
             graph_data = self.create_graph_data(
@@ -484,33 +516,35 @@ class RFIDLocalization:
             with torch.no_grad():
                 out = self.model(graph_data)
                 # 提取新节点预测
-                pred_pos = out[-1].cpu().numpy()
-
+                pred_pos = out[-1]
                 predicted_positions.append(pred_pos)
 
         # 计算误差
-        predicted_positions = np.array(predicted_positions)
+        predicted_positions = torch.stack(predicted_positions)
 
         # 反标准化以获得实际坐标
         predicted_positions_orig = self.labels_scaler.inverse_transform(
-            predicted_positions
+            predicted_positions.cpu().numpy()
         )
+        predicted_positions_orig = self.to_device(
+            torch.tensor(predicted_positions_orig, dtype=torch.float32))
 
         # 计算欧几里得距离误差
-        distances = np.sqrt(np.sum((test_labels - predicted_positions_orig)**2, axis=1))
-        avg_distance = np.mean(distances)
+        distances = torch.sqrt(
+            torch.sum((test_labels - predicted_positions_orig)**2, dim=1))
+        avg_distance = torch.mean(distances).item()
 
         if self.config['PREDICTION_LOG']:
             print("\n新标签位置预测评估:")
             print(f"测试样本数量: {len(test_features)}")
             print(f"平均预测误差: {avg_distance:.2f}米")
-            print(f"最大误差: {np.max(distances):.2f}米")
-            print(f"最小误差: {np.min(distances):.2f}米")
-            print(f"误差标准差: {np.std(distances):.2f}米")
+            print(f"最大误差: {torch.max(distances).item():.2f}米")
+            print(f"最小误差: {torch.min(distances).item():.2f}米")
+            print(f"误差标准差: {torch.std(distances).item():.2f}米")
 
             # 计算不同误差阈值下的准确率
             for threshold in [0.5, 1.0, 1.5, 2.0]:
-                accuracy = np.mean(distances < threshold) * 100
+                accuracy = (distances < threshold).float().mean().item() * 100
                 print(f"误差 < {threshold}米的准确率: {accuracy:.2f}%")
 
         return avg_distance
@@ -524,41 +558,46 @@ class RFIDLocalization:
             len(self.features_norm)
         )
         train_mask = train_mask | test_mask
-        # 检查是否有可用的GPU
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # 准备数据
         X = self.features_norm.to(device)
         y = self.labels_norm.to(device)
 
-        # 数据增强 - 只对训练集进行增强
-        X_train = X[train_mask].cpu().numpy()
-        y_train = y[train_mask].cpu().numpy()
-
-        # 根据配置决定是否进行数据增强
+        # 数据增强
         if self.config.get('DATA_AUGMENTATION', False):
             # 数据增强方法1: 添加高斯噪声
             noise_scale = 0.15  # 噪声比例
-            X_noisy = X_train + np.random.normal(0, noise_scale, X_train.shape)
+            X_noisy = self.to_device(torch.tensor(
+                X[train_mask].cpu().numpy() + np.random.normal(0, noise_scale,
+                                                               X[train_mask].cpu().numpy().shape),
+                dtype=torch.float32
+            ))
 
             # 数据增强方法2: 特征缩放
-            scale_factors = np.random.uniform(0.9, 1.1, (X_train.shape[0], 1))
-            X_scaled = X_train * scale_factors
+            scale_factors = np.random.uniform(
+                0.9, 1.1, (X[train_mask].cpu().numpy().shape[0], 1))
+            X_scaled = self.to_device(torch.tensor(
+                X[train_mask].cpu().numpy() * scale_factors,
+                dtype=torch.float32
+            ))
 
             # 数据增强方法3: RSSI和相位混合扰动
-            X_mixed = X_train.copy()
-            X_mixed[:, :4] += np.random.uniform(-0.03, 0.03, (X_train.shape[0], 4))
-            X_mixed[:, 4:] += np.random.uniform(-0.03, 0.03, (X_train.shape[0], 4))
+            X_mixed = X[train_mask].cpu().numpy().copy()
+            X_mixed[:, :4] += np.random.uniform(-0.03, 0.03,
+                                                (X[train_mask].cpu().numpy().shape[0], 4))
+            X_mixed[:, 4:] += np.random.uniform(-0.03, 0.03,
+                                                (X[train_mask].cpu().numpy().shape[0], 4))
+            X_mixed = self.to_device(
+                torch.tensor(X_mixed, dtype=torch.float32))
 
             # 合并原始数据和增强数据
-            X_augmented = np.vstack([X_train, X_noisy, X_scaled, X_mixed])
-            y_augmented = np.vstack([y_train] * 4)
-
-            X_train_tensor = torch.tensor(X_augmented, dtype=torch.float32).to(device)
-            y_train_tensor = torch.tensor(y_augmented, dtype=torch.float32).to(device)
+            X_train_tensor = torch.cat(
+                [X[train_mask], X_noisy, X_scaled, X_mixed], dim=0)
+            y_train_tensor = torch.cat([y[train_mask]] * 4, dim=0)
 
             if self.config['TRAIN_LOG']:
-                print(f"使用数据增强: 原始样本数 {len(X_train)}, 增强后样本数 {len(X_augmented)}")
+                print(
+                    f"使用数据增强: 原始样本数 {len(X[train_mask])}, 增强后样本数 {len(X_train_tensor)}")
         else:
             X_train_tensor = X[train_mask]
             y_train_tensor = y[train_mask]
@@ -591,6 +630,10 @@ class RFIDLocalization:
         counter = 0  # 计数器
         best_val_avg_distance = float('inf')
 
+        # 清空损失记录
+        self.mlp_train_losses = []
+        self.mlp_val_losses = []
+
         for epoch in range(1000):
             # 训练阶段
             self.mlp_model.train()
@@ -607,9 +650,15 @@ class RFIDLocalization:
                 val_loss = loss_fn(val_out, y[val_mask])
                 out_orig = val_out * data_range + data_min
                 y_orig = y[val_mask] * data_range + data_min
-                val_distances = torch.sqrt(torch.sum((out_orig - y_orig)**2, dim=1))
-                val_accuracy = (val_distances < 0.3).float().mean().item() * 100
+                val_distances = torch.sqrt(
+                    torch.sum((out_orig - y_orig)**2, dim=1))
+                val_accuracy = (
+                    val_distances < 0.3).float().mean().item() * 100
                 val_avg_distance = val_distances.mean().item()
+
+            # 保存每个epoch的损失值
+            self.mlp_train_losses.append(train_loss.item())
+            self.mlp_val_losses.append(val_loss.item())
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -639,12 +688,52 @@ class RFIDLocalization:
         self.mlp_model.load_state_dict(best_model)
         return best_val_loss, best_val_avg_distance, best_model
 
+    def plot_loss_comparison(self, save_path=None):
+        """绘制MLP和GAT的训练和验证损失对比图"""
+        if len(self.mlp_train_losses) == 0 or len(self.gat_train_losses) == 0:
+            print("没有可用的损失数据来绘制图表")
+            return
+
+        plt.figure(figsize=(12, 8))
+
+        # 确保目录存在
+        if save_path:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+        # 绘制训练损失
+        plt.subplot(2, 1, 1)
+        epochs_mlp = range(1, len(self.mlp_train_losses) + 1)
+        epochs_gat = range(1, len(self.gat_train_losses) + 1)
+
+        plt.plot(epochs_mlp, self.mlp_train_losses, 'b-', label='MLP训练损失')
+        plt.plot(epochs_gat, self.gat_train_losses, 'r-', label='GAT训练损失')
+        plt.title('MLP vs GAT 训练损失对比')
+        plt.xlabel('轮次')
+        plt.ylabel('损失')
+        plt.legend()
+        plt.grid(True)
+
+        # 绘制验证损失
+        plt.subplot(2, 1, 2)
+        plt.plot(epochs_mlp, self.mlp_val_losses, 'b-', label='MLP验证损失')
+        plt.plot(epochs_gat, self.gat_val_losses, 'r-', label='GAT验证损失')
+        plt.title('MLP vs GAT 验证损失对比')
+        plt.xlabel('轮次')
+        plt.ylabel('损失')
+        plt.legend()
+        plt.grid(True)
+
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path)
+        else:
+            plt.show()
+
     def evaluate_mlp_on_new_data(self, test_features, test_labels):
         """评估MLP模型在新数据上的性能"""
         if self.mlp_model is None:
             raise ValueError("MLP模型未训练。请先调用train_mlp_model。")
-
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # 获取RSSI和相位值
         rssi_values = test_features[:, :4]
@@ -656,7 +745,8 @@ class RFIDLocalization:
 
         # 组合特征
         features_norm = np.hstack([rssi_norm, phase_norm])
-        features_tensor = torch.tensor(features_norm, dtype=torch.float32).to(device)
+        features_tensor = torch.tensor(
+            features_norm, dtype=torch.float32).to(device)
 
         # 预测
         self.mlp_model.eval()
@@ -669,7 +759,8 @@ class RFIDLocalization:
             )
 
             # 计算欧几里得距离误差
-            distances = np.sqrt(np.sum((test_labels - predictions_orig)**2, axis=1))
+            distances = np.sqrt(
+                np.sum((test_labels - predictions_orig)**2, axis=1))
             avg_distance = np.mean(distances)
 
         if self.config['PREDICTION_LOG']:
@@ -703,8 +794,8 @@ class RFIDLocalization:
             k = self.config['K']
 
         # 提取参考标签的RSSI值（用于标准化）
-        reference_rssi = self.features[:, :4].numpy()  # 只取RSSI值
-        reference_locations = self.labels.numpy()  # 参考标签位置
+        reference_rssi = self.features.cpu().numpy()  # 先将数据移到CPU
+        reference_locations = self.labels.cpu().numpy()  # 先将数据移到CPU
 
         # 计算测试标签预测位置
         predictions = []
@@ -712,10 +803,12 @@ class RFIDLocalization:
         # 遍历每个测试样本
         for i in range(len(test_features)):
             # 提取当前测试标签的RSSI值
-            test_rssi = test_features[i, :4].numpy().reshape(1, -1)
+            test_rssi = test_features[i].cpu(
+            ).numpy().reshape(1, -1)  # 先将数据移到CPU
 
             # 计算欧氏距离（信号空间距离）
-            signal_distances = np.sqrt(np.sum((reference_rssi - test_rssi)**2, axis=1))
+            signal_distances = np.sqrt(
+                np.sum((reference_rssi - test_rssi)**2, axis=1))
 
             # 找到k个最近的参考标签索引
             nearest_indices = np.argsort(signal_distances)[:k]
@@ -742,8 +835,9 @@ class RFIDLocalization:
         # 如果提供了真实位置，计算误差
         avg_error = None
         if test_labels is not None:
-            test_labels_np = test_labels.numpy()
-            distances = np.sqrt(np.sum((predictions - test_labels_np)**2, axis=1))
+            test_labels_np = test_labels.cpu().numpy()  # 先将数据移到CPU
+            distances = np.sqrt(
+                np.sum((predictions - test_labels_np)**2, axis=1))
             avg_error = np.mean(distances)
 
             if self.config['PREDICTION_LOG']:
@@ -760,6 +854,16 @@ class RFIDLocalization:
                     print(f"误差 < {threshold}米的准确率: {accuracy:.2f}%")
 
         return predictions, avg_error
+
+    def to_device(self, data):
+        """将数据移动到指定设备"""
+        if isinstance(data, torch.Tensor):
+            return data.to(self.device)
+        elif isinstance(data, (list, tuple)):
+            return [self.to_device(x) for x in data]
+        elif isinstance(data, dict):
+            return {k: self.to_device(v) for k, v in data.items()}
+        return data
 
 
 def load_and_preprocess_test_data(test_csv_path, scaler_rssi=None, scaler_phase=None):
@@ -779,8 +883,8 @@ def load_and_preprocess_test_data(test_csv_path, scaler_rssi=None, scaler_phase=
     test_labels = torch.tensor(
         df_test[['true_x', 'true_y']].values, dtype=torch.float32
     )
-    test_features_np = np.array(test_features)
-    test_labels_np = np.array(test_labels)
+    test_features_np = test_features.cpu().numpy()
+    test_labels_np = test_labels.cpu().numpy()
     if scaler_rssi is not None and scaler_phase is not None:
         rssi_norm = scaler_rssi.transform(test_features_np[:, :4])
         phase_norm = scaler_phase.transform(test_features_np[:, 4:8])
@@ -812,8 +916,6 @@ def run_grid_search(
         dropout_range: Dropout比率范围
     """
     start_time = time.time()  # 记录开始时间
-    # 检查是否有可用的GPU
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # 设置默认搜索范围
     if k_range is None:
         k_range = [4, 5, 6, 7, 8]
@@ -844,7 +946,8 @@ def run_grid_search(
         if len(lr_range) > 2:
             lr_range = [lr_range[0], lr_range[-1]]
         if len(weight_decay_range) > 2:
-            weight_decay_range = [weight_decay_range[0], weight_decay_range[-1]]
+            weight_decay_range = [
+                weight_decay_range[0], weight_decay_range[-1]]
         if len(hidden_channels_range) > 2:
             hidden_channels_range = [
                 hidden_channels_range[0], hidden_channels_range[-1]
@@ -905,7 +1008,8 @@ def run_grid_search(
         localization.mlp_model.load_state_dict(best_model)
         # 在测试集数据上评估模型性能
         rssi_norm = localization.scaler_rssi.transform(test_features_np[:, :4])
-        phase_norm = localization.scaler_phase.transform(test_features_np[:, 4:8])
+        phase_norm = localization.scaler_phase.transform(
+            test_features_np[:, 4:8])
         test_features_norm = np.hstack([rssi_norm, phase_norm])
         test_features_tensor = torch.tensor(test_features_norm,
                                             dtype=torch.float32).to(device)
@@ -915,7 +1019,8 @@ def run_grid_search(
             predictions_orig = localization.labels_scaler.inverse_transform(
                 predictions.cpu().numpy()
             )
-            distances = np.sqrt(np.sum((test_labels_np - predictions_orig)**2, axis=1))
+            distances = np.sqrt(
+                np.sum((test_labels_np - predictions_orig)**2, axis=1))
             test_avg_distance = np.mean(distances)
         result = {
             'lr': lr,
@@ -1071,23 +1176,26 @@ def main():
         print("使用默认超参数训练模型")
         best_params = {
             'K': CONFIG['K'],
-            'lr': 0.001,
-            'weight_decay': 5e-5,
-            'hidden_channels': 64,
-            'heads': 2
+            # 'lr': 0.001,
+            # 'weight_decay': 5e-5,
+            # 'hidden_channels': 64,
+            # 'heads': 2
         }
         config = CONFIG.copy()
 
     # 初始化定位系统
     localization = RFIDLocalization(config)
 
+    # 确保结果目录存在
+    os.makedirs('results', exist_ok=True)
+
     # 训练并评估MLP模型
     if config['OPEN_MLP']:
         localization.train_mlp_model(
             hidden_channels=best_params.get('hidden_channels', 128),
-            dropout=best_params.get('dropout', 0.1),
-            lr=best_params.get('lr', 0.001),
-            weight_decay=best_params.get('weight_decay', 0.0005)
+            dropout=best_params.get('dropout', 0.2),
+            lr=best_params.get('lr', 0.01),
+            weight_decay=best_params.get('weight_decay', 0.0001)
         )
         # 在新数据上评估MLP模型
         mlp_prediction_error = localization.evaluate_mlp_on_new_data(
@@ -1099,18 +1207,18 @@ def main():
     if CONFIG['GRID_SEARCH']:
         localization.model = GATLocalizationModel(
             in_channels=localization.features_norm.shape[1],
-            hidden_channels=best_params['hidden_channels'],
+            hidden_channels=best_params.get('hidden_channels', 128),
             out_channels=2,
-            heads=best_params['heads']
+            heads=best_params.get('heads', 3)
         )
 
     # 训练并评估GAT模型
     if config['OPEN_GAT']:
         best_val_avg_distance, best_val_loss = localization.train_gat_model(
-            hidden_channels=best_params['hidden_channels'],
-            heads=best_params['heads'],
-            lr=best_params['lr'],
-            weight_decay=best_params['weight_decay']
+            hidden_channels=best_params.get('hidden_channels', 128),
+            heads=best_params.get('heads', 3),
+            lr=best_params.get('lr', 0.001),
+            weight_decay=best_params.get('weight_decay', 0.0005)
         )
         print(f"GAT模型测试集平均误差: {best_val_avg_distance:.2f}米")
 
@@ -1122,10 +1230,16 @@ def main():
         )
         print(f"GAT模型在新标签上的平均预测误差: {gat_prediction_error:.2f}米")
 
+    # 如果MLP和GAT都已训练，则绘制损失对比图
+    if config['OPEN_MLP'] and config['OPEN_GAT']:
+        localization.plot_loss_comparison(
+            save_path='results/loss_comparison.png')
+        # 将损失数据保存到CSV文件中
+
     if config['OPEN_KNN']:
         # 训练和评估KNN模型
-        features_array = np.array(localization.features)
-        labels_array = np.array(localization.labels)
+        features_array = localization.features.cpu().numpy()  # 先将数据移到CPU
+        labels_array = localization.labels.cpu().numpy()  # 先将数据移到CPU
         knn_model = localization.knn_localization(
             features_array, labels_array, n_neighbors=config['K']
         )
