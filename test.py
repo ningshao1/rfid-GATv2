@@ -20,6 +20,9 @@ import itertools
 import time
 import os
 
+# 导入自定义模型
+from models import HeterogeneousGNNModel, create_heterogeneous_graph_data, add_new_node_to_hetero_graph
+
 # 忽略警告
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -31,10 +34,11 @@ CONFIG = {
     'OPEN_KNN': True,  # 启用KNN算法进行比较
     'TRAIN_LOG': False,  # 启用训练日志
     'PREDICTION_LOG': False,  # 启用预测日志
-    'GRID_SEARCH': False,  # 是否启用网格搜索
-    'QUICK_SEARCH': False,  # 是否使用快速搜索（减少组合数量）
+    'GRID_SEARCH': True,  # 是否启用网格搜索
+    'QUICK_SEARCH': True,  # 是否使用快速搜索（减少组合数量）
     'OPEN_MLP': True,  # 启用MLP算法进行比较
     'OPEN_GAT': True,  # 启用GAT算法进行比较
+    'OPEN_HETERO': True,  # 启用异构图算法进行比较
     'DATA_AUGMENTATION': False,  # 是否启用数据增强
     'OPEN_LANDMARC': True,  # 启用LANDMARC算法进行比较
 }
@@ -158,12 +162,23 @@ class RFIDLocalization:
         self.labels_scaler = MinMaxScaler()
         self.model = None
         self.mlp_model = None
+        self.hetero_model = None  # 异构图模型
+
+        # 天线位置
+        self.antenna_locations = torch.tensor([
+            [0.0, 0.0],  # 天线1 (0,0)
+            [0.0, 10.0],  # 天线2 (0,10)
+            [10.0, 0.0],  # 天线3 (10,0)
+            [10.0, 10.0]  # 天线4 (10,10)
+        ], dtype=torch.float32).to(self.device)
 
         # 添加损失值记录
         self.gat_train_losses = []
         self.gat_val_losses = []
         self.mlp_train_losses = []
         self.mlp_val_losses = []
+        self.hetero_train_losses = []  # 异构图模型训练损失
+        self.hetero_val_losses = []    # 异构图模型验证损失
 
         # 加载数据
         self.load_data()
@@ -217,39 +232,12 @@ class RFIDLocalization:
         if pos is None:
             pos = self.labels
 
-        # 添加天线节点
-        antenna_locations = torch.tensor([
-            [0.0, 0.0],  # 天线1 (0,0)
-            [0.0, 10.0],  # 天线2 (0,10)
-            [10.0, 0.0],  # 天线3 (10,0)
-            [10.0, 10.0]  # 天线4 (10,10)
-        ], dtype=torch.float32).to(self.device)
-
-        # 标准化天线位置
-        antenna_locations_norm = self.to_device(torch.tensor(
-            self.labels_scaler.transform(antenna_locations.cpu().numpy()),
-            dtype=torch.float32
-        ))
-
-        # 为天线节点创建特征，使用全-1值作为天线特征的标识
-        antenna_features = torch.full((4, features_norm.shape[1]), -1.0,
-                                      dtype=torch.float32).to(self.device)
-
-        # 合并标签节点和天线节点
-        all_features = torch.cat([features_norm, antenna_features], dim=0)
-        all_labels = torch.cat([labels_norm, antenna_locations_norm], dim=0)
-
-        # 保存天线在节点列表中的索引
-        antenna_indices = torch.arange(
-            len(features_norm), len(features_norm) + 4).to(self.device)
-
         # 使用标签（位置）构建KNN图
         adj_matrix = kneighbors_graph(
             torch.as_tensor(
                 np.hstack([
-                    0.2 * all_features.cpu().numpy(),
-                    # 0.6 * features_norm[:, 4:8].cpu().numpy(),
-                    0.8 * all_labels.cpu().numpy()
+                    0.2 * features_norm.cpu().numpy(),
+                    0.8 * labels_norm.cpu().numpy()
                 ])
             ),
             n_neighbors=k,
@@ -263,63 +251,12 @@ class RFIDLocalization:
         edge_attr = self.to_device(torch.tensor(
             adj_matrix_coo.data, dtype=torch.float32))
 
-        # 添加每个标签节点到对应天线的边（使其始终连接）
-        additional_edges = []
-        additional_edge_attrs = []
-
-        # 为每个标签节点添加到各个天线的连接
-        for node_idx in range(len(features_norm)):
-            for ant_idx, antenna_idx in enumerate(antenna_indices):
-                # 计算标签节点到天线的欧氏距离（作为边属性）
-                # 同时考虑位置和特征信息，但分开计算避免维度不匹配
-                pos_dist = torch.sqrt(
-                    torch.sum((all_labels[node_idx] - all_labels[antenna_idx])**2))
-                # 特征距离只考虑标签节点的特征（天线节点的特征是-1）
-                # 将特征距离归一化到与位置距离相似的范围
-                feat_weight = 0.3  # 特征权重
-                dist = (1-feat_weight)*pos_dist+feat_weight * \
-                    torch.norm(features_norm[node_idx])
-
-                # 添加双向边
-                additional_edges.append([node_idx, antenna_idx])
-                additional_edges.append([antenna_idx, node_idx])
-
-                additional_edge_attrs.append(dist)
-                additional_edge_attrs.append(dist)
-
-        # 将额外边和边属性转换为张量
-        if additional_edges:
-            additional_edges_tensor = self.to_device(
-                torch.tensor(additional_edges, dtype=torch.long).t())
-            additional_edge_attrs_tensor = self.to_device(
-                torch.tensor(additional_edge_attrs, dtype=torch.float32))
-
-            # 合并原始边和附加边
-            edge_index = torch.cat(
-                [edge_index, additional_edges_tensor], dim=1)
-            edge_attr = torch.cat([edge_attr, additional_edge_attrs_tensor])
-
-        # 更新位置字典，加入天线位置
-        if isinstance(pos, torch.Tensor):
-            # 确保设备一致
-            antenna_positions = antenna_locations
-            if pos.device != antenna_positions.device:
-                # 将两者都移动到同一设备
-                pos = pos.to(self.device)
-                antenna_positions = antenna_positions.to(self.device)
-            all_pos = torch.cat([pos, antenna_positions], dim=0)
-        else:  # 如果pos是字典
-            all_pos = pos.copy() if hasattr(pos, 'copy') else dict(pos)
-            for i, antenna_idx in enumerate(antenna_indices):
-                all_pos[antenna_idx.item()] = (
-                    antenna_locations[i][0].item(), antenna_locations[i][1].item())
-
         return Data(
-            x=self.to_device(all_features),
+            x=self.to_device(features_norm),
             edge_index=edge_index,
             edge_attr=edge_attr,
-            y=self.to_device(all_labels),
-            pos=all_pos
+            y=self.to_device(labels_norm),
+            pos=pos
         )
 
     def create_data_masks(self, num_nodes, test_size=0.2, val_size=0.2):
@@ -357,27 +294,14 @@ class RFIDLocalization:
             self.features_norm, self.labels_norm, k=self.config['K']
         )
 
-        # 计算添加天线后的节点总数
-        total_nodes = len(self.features_norm) + 4  # 原始节点 + 4个天线节点
-
         # 创建训练、验证和测试掩码
         train_mask, val_mask, test_mask = self.create_data_masks(
             len(self.features_norm)  # 只针对原始节点创建掩码
         )
 
-        # 将掩码扩展以包含天线节点（天线节点不参与训练）
-        extended_train_mask = self.to_device(
-            torch.zeros(total_nodes, dtype=torch.bool))
-        extended_val_mask = self.to_device(
-            torch.zeros(total_nodes, dtype=torch.bool))
-
-        # 复制原始掩码到扩展掩码的前部分
-        extended_train_mask[:len(train_mask)] = train_mask
-        extended_val_mask[:len(val_mask)] = val_mask
-
         # 将掩码添加到图数据中
-        full_graph_data.train_mask = extended_train_mask
-        full_graph_data.val_mask = extended_val_mask
+        full_graph_data.train_mask = train_mask
+        full_graph_data.val_mask = val_mask
 
         # 将数据移动到设备
         full_graph_data = full_graph_data.to(device)
@@ -445,14 +369,8 @@ class RFIDLocalization:
                 y_orig = full_graph_data.y * data_range + data_min
 
                 # 计算训练集和验证集的指标（使用原始坐标）
-                # 只考虑非天线节点的性能
-                original_nodes_mask = torch.zeros(
-                    total_nodes, dtype=torch.bool, device=device)
-                original_nodes_mask[:len(self.features_norm)] = True
-
-                # 获取训练和验证节点中的非天线节点
-                train_mask_orig = full_graph_data.train_mask & original_nodes_mask
-                val_mask_orig = full_graph_data.val_mask & original_nodes_mask
+                train_mask_orig = full_graph_data.train_mask
+                val_mask_orig = full_graph_data.val_mask
 
                 if train_mask_orig.sum() > 0:
                     train_distances = torch.sqrt(
@@ -615,7 +533,7 @@ class RFIDLocalization:
                 temp_labels
             ], dim=0)
 
-            # 创建图数据（会自动添加天线节点）
+            # 创建图数据
             graph_data = self.create_graph_data(
                 all_features, all_labels, k=self.config['K'], pos=self.labels
             )
@@ -624,8 +542,7 @@ class RFIDLocalization:
             self.model.eval()
             with torch.no_grad():
                 out = self.model(graph_data)
-                # 获取新样本节点预测 - 它在原始节点之后，但在天线节点之前
-                # 新样本节点的索引就是原始节点数量的位置
+                # 获取新样本节点预测 - 它在原始节点之后
                 pred_idx = len(self.features_norm)
                 pred_pos = out[pred_idx]
                 predicted_positions.append(pred_pos)
@@ -976,6 +893,397 @@ class RFIDLocalization:
             return {k: self.to_device(v) for k, v in data.items()}
         return data
 
+    def train_hetero_model(self, hidden_channels=64, heads=3, lr=0.005, weight_decay=5e-4):
+        """
+        训练异构图神经网络模型
+
+        参数:
+            hidden_channels: 隐藏层神经元数量
+            heads: 注意力头数量
+            lr: 学习率
+            weight_decay: 权重衰减
+
+        返回:
+            验证集的平均误差和损失
+        """
+        # 首先创建训练和验证掩码
+        train_mask, val_mask, test_mask = self.create_data_masks(
+            len(self.features_norm)
+        )
+
+        # 标准化天线位置
+        antenna_locations_norm = self.to_device(torch.tensor(
+            self.labels_scaler.transform(self.antenna_locations.cpu().numpy()),
+            dtype=torch.float32
+        ))
+
+        # 创建异构图数据
+        hetero_data = create_heterogeneous_graph_data(
+            self.features_norm,
+            self.labels_norm,
+            antenna_locations_norm,
+            k=self.config['K'],
+            device=self.device
+        )
+
+        # 创建异构图模型
+        torch.manual_seed(self.config['RANDOM_SEED'])
+        self.hetero_model = HeterogeneousGNNModel(
+            in_channels=self.features_norm.shape[1],
+            hidden_channels=hidden_channels,
+            out_channels=2,
+            heads=heads
+        ).to(self.device)
+
+        # 添加训练和验证掩码到异构数据
+        hetero_data['tag'].train_mask = train_mask | test_mask
+        hetero_data['tag'].val_mask = val_mask
+
+        # 创建优化器
+        torch.manual_seed(self.config['RANDOM_SEED'])
+        optimizer = torch.optim.Adam(
+            self.hetero_model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay
+        )
+        loss_fn = torch.nn.MSELoss()
+
+        # 为MinMaxScaler参数创建张量
+        data_min = torch.as_tensor(
+            self.labels_scaler.data_min_,
+            dtype=torch.float32
+        ).to(self.device)
+        data_range = torch.as_tensor(
+            self.labels_scaler.data_range_,
+            dtype=torch.float32
+        ).to(self.device)
+
+        # 开始训练
+        best_val_loss = float('inf')
+        best_model = None
+        patience = 50  # 早停耐心值
+        counter = 0  # 计数器
+        best_val_avg_distance = float('inf')
+
+        # 清空损失记录
+        self.hetero_train_losses = []
+        self.hetero_val_losses = []
+
+        # 准备edge_index和edge_attr字典
+        edge_index_dict = {
+            ('tag', 'to', 'tag'): hetero_data['tag', 'to', 'tag'].edge_index,
+            ('tag', 'to', 'antenna'): hetero_data['tag', 'to', 'antenna'].edge_index,
+            ('antenna', 'to', 'tag'): hetero_data['antenna', 'to', 'tag'].edge_index
+        }
+
+        edge_attr_dict = {
+            ('tag', 'to', 'tag'): hetero_data['tag', 'to', 'tag'].edge_attr,
+            ('tag', 'to', 'antenna'): hetero_data['tag', 'to', 'antenna'].edge_attr,
+            ('antenna', 'to', 'tag'): hetero_data['antenna', 'to', 'tag'].edge_attr
+        }
+
+        # 准备节点特征字典
+        x_dict = {
+            'tag': hetero_data['tag'].x,
+            'antenna': hetero_data['antenna'].x
+        }
+
+        # 训练循环
+        for epoch in range(1000):
+            # 训练阶段
+            self.hetero_model.train()
+            optimizer.zero_grad()
+
+            # 前向传播
+            out = self.hetero_model(x_dict, edge_index_dict, edge_attr_dict)
+
+            # 计算损失 - 只考虑训练掩码中的标签节点
+            train_loss = loss_fn(
+                out[hetero_data['tag'].train_mask],
+                hetero_data['tag'].y[hetero_data['tag'].train_mask]
+            )
+            train_loss.backward()
+            optimizer.step()
+
+            # 验证阶段
+            self.hetero_model.eval()
+            with torch.no_grad():
+                # 前向传播
+                out = self.hetero_model(
+                    x_dict, edge_index_dict, edge_attr_dict)
+
+                # 计算验证损失 - 只考虑验证掩码中的标签节点
+                val_loss = loss_fn(
+                    out[hetero_data['tag'].val_mask],
+                    hetero_data['tag'].y[hetero_data['tag'].val_mask]
+                )
+
+                # 将预测结果转换回原始比例（逆MinMaxScaler）
+                out_orig = out * data_range + data_min
+                y_orig = hetero_data['tag'].y * data_range + data_min
+
+                # 计算训练集和验证集的距离误差
+                train_distances = torch.sqrt(
+                    torch.sum((
+                        out_orig[hetero_data['tag'].train_mask] -
+                        y_orig[hetero_data['tag'].train_mask]
+                    )**2, dim=1)
+                )
+                train_accuracy = (train_distances <
+                                  0.3).float().mean().item() * 100
+                train_avg_distance = train_distances.mean().item()
+
+                val_distances = torch.sqrt(
+                    torch.sum((
+                        out_orig[hetero_data['tag'].val_mask] -
+                        y_orig[hetero_data['tag'].val_mask]
+                    )**2, dim=1)
+                )
+                val_accuracy = (
+                    val_distances < 0.3).float().mean().item() * 100
+                val_avg_distance = val_distances.mean().item()
+
+            # 保存每个epoch的损失值
+            self.hetero_train_losses.append(train_loss.item())
+            self.hetero_val_losses.append(val_loss.item())
+
+            # 早停检查
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_val_avg_distance = val_avg_distance
+                best_model = self.hetero_model.state_dict().copy()
+                counter = 0
+            else:
+                counter += 1
+                if counter >= patience:
+                    if self.config['TRAIN_LOG']:
+                        print(
+                            f"异构图模型轮次 {epoch}\n"
+                            f"训练集 - 损失: {train_loss.item():.4f}, 准确率: {train_accuracy:.2f}%, 平均误差: {train_avg_distance:.2f}米\n"
+                            f"验证集 - 损失: {val_loss.item():.4f}, 准确率: {val_accuracy:.2f}%, 平均误差: {val_avg_distance:.2f}米"
+                        )
+                        print(f"\n触发早停！在轮次 {epoch} 停止训练")
+                        print(f"最佳验证损失: {best_val_loss:.4f}")
+
+                    # 加载最佳模型
+                    self.hetero_model.load_state_dict(best_model)
+                    break
+
+            if epoch % 100 == 0 and self.config['TRAIN_LOG']:
+                print(
+                    f"异构图模型轮次 {epoch}\n"
+                    f"训练集 - 损失: {train_loss.item():.4f}, 准确率: {train_accuracy:.2f}%, 平均误差: {train_avg_distance:.2f}米\n"
+                    f"验证集 - 损失: {val_loss.item():.4f}, 准确率: {val_accuracy:.2f}%, 平均误差: {val_avg_distance:.2f}米"
+                )
+
+        return best_val_avg_distance, best_val_loss.item()
+
+    def evaluate_prediction_hetero_accuracy(self, test_data=None, num_samples=50):
+        """
+        评估异构图模型在新标签预测上的准确性
+
+        参数:
+            test_data: 测试数据，格式为(特征，标签)的元组
+            num_samples: 如果没有提供测试数据，随机抽样的样本数量
+
+        返回:
+            平均预测误差距离
+        """
+        if self.hetero_model is None:
+            raise ValueError("异构图模型未训练。请先调用train_hetero_model。")
+
+        # 如果没有提供测试数据，则从现有数据中随机抽样
+        if test_data is None:
+            # 随机抽样
+            indices = np.random.choice(
+                len(self.features), num_samples, replace=False)
+            test_features = self.features[indices]
+            test_labels = self.labels[indices]
+        else:
+            test_features, test_labels = test_data
+            test_features = self.to_device(
+                torch.tensor(test_features, dtype=torch.float32))
+            test_labels = self.to_device(
+                torch.tensor(test_labels, dtype=torch.float32))
+
+        # 标准化测试特征
+        rssi_values = test_features[:, :4]
+        phase_values = test_features[:, 4:8]
+        rssi_norm = self.scaler_rssi.transform(rssi_values.cpu().numpy())
+        phase_norm = self.scaler_phase.transform(phase_values.cpu().numpy())
+        features_norm = np.hstack([rssi_norm, phase_norm])
+        features_norm = self.to_device(
+            torch.tensor(features_norm, dtype=torch.float32))
+
+        # 预测结果列表
+        predicted_positions = []
+
+        # 确保MLP模型已训练，用于初始估计
+        if self.mlp_model is None:
+            self.train_mlp_model()
+
+        # 标准化天线位置
+        antenna_locations_norm = self.to_device(torch.tensor(
+            self.labels_scaler.transform(self.antenna_locations.cpu().numpy()),
+            dtype=torch.float32
+        ))
+
+        # 单独预测每个测试样本
+        for i in range(len(features_norm)):
+            # 提取单个样本特征
+            sample_features = features_norm[i:i+1]
+
+            # 使用MLP估计初始位置
+            self.mlp_model.eval()
+            with torch.no_grad():
+                mlp_pred = self.mlp_model(sample_features)
+            temp_labels = self.to_device(mlp_pred)
+
+            # 使用add_new_node_to_hetero_graph添加新节点
+            # 首先创建初始异构图
+            full_hetero_data = create_heterogeneous_graph_data(
+                self.features_norm,
+                self.labels_norm,
+                antenna_locations_norm,
+                k=self.config['K'],
+                device=self.device
+            )
+
+            # 添加新节点
+            new_hetero_data = add_new_node_to_hetero_graph(
+                full_hetero_data,
+                sample_features,
+                temp_labels,
+                k=self.config['K'],
+                device=self.device
+            )
+
+            # 准备edge_index和edge_attr字典
+            edge_index_dict = {
+                ('tag', 'to', 'tag'): new_hetero_data['tag', 'to', 'tag'].edge_index,
+                ('tag', 'to', 'antenna'): new_hetero_data['tag', 'to', 'antenna'].edge_index,
+                ('antenna', 'to', 'tag'): new_hetero_data['antenna', 'to', 'tag'].edge_index
+            }
+
+            edge_attr_dict = {
+                ('tag', 'to', 'tag'): new_hetero_data['tag', 'to', 'tag'].edge_attr,
+                ('tag', 'to', 'antenna'): new_hetero_data['tag', 'to', 'antenna'].edge_attr,
+                ('antenna', 'to', 'tag'): new_hetero_data['antenna', 'to', 'tag'].edge_attr
+            }
+
+            # 准备节点特征字典
+            x_dict = {
+                'tag': new_hetero_data['tag'].x,
+                'antenna': new_hetero_data['antenna'].x
+            }
+
+            # 使用异构图模型进行预测
+            self.hetero_model.eval()
+            with torch.no_grad():
+                out = self.hetero_model(
+                    x_dict, edge_index_dict, edge_attr_dict)
+
+                # 获取新节点的预测 - 使用tag_mask找到新节点
+                new_node_idx = torch.where(new_hetero_data['tag'].tag_mask)[0]
+                pred_pos = out[new_node_idx]
+                predicted_positions.append(pred_pos)
+
+        # 堆叠预测结果
+        predicted_positions = torch.cat(predicted_positions, dim=0)
+
+        # 反标准化以获得实际坐标
+        predicted_positions_orig = self.labels_scaler.inverse_transform(
+            predicted_positions.cpu().numpy()
+        )
+        predicted_positions_orig = self.to_device(
+            torch.tensor(predicted_positions_orig, dtype=torch.float32)
+        )
+
+        # 计算欧几里得距离误差
+        distances = torch.sqrt(
+            torch.sum((test_labels - predicted_positions_orig)**2, dim=1)
+        )
+        avg_distance = torch.mean(distances).item()
+
+        if self.config['PREDICTION_LOG']:
+            print("\n异构图模型新标签位置预测评估:")
+            print(f"测试样本数量: {len(test_features)}")
+            print(f"平均预测误差: {avg_distance:.2f}米")
+            print(f"最大误差: {torch.max(distances).item():.2f}米")
+            print(f"最小误差: {torch.min(distances).item():.2f}米")
+            print(f"误差标准差: {torch.std(distances).item():.2f}米")
+
+            # 计算不同误差阈值下的准确率
+            for threshold in [0.5, 1.0, 1.5, 2.0]:
+                accuracy = (distances < threshold).float().mean().item() * 100
+                print(f"误差 < {threshold}米的准确率: {accuracy:.2f}%")
+
+        return avg_distance
+
+    def plot_all_models_loss_comparison(self, save_path=None):
+        """
+        绘制MLP、GAT和异构图模型的训练和验证损失对比图
+
+        参数:
+            save_path: 图像保存路径，不提供则显示图像
+        """
+        # 检查是否有足够的损失数据
+        has_mlp = len(self.mlp_train_losses) > 0
+        has_gat = len(self.gat_train_losses) > 0
+        has_hetero = len(self.hetero_train_losses) > 0
+
+        if not (has_mlp or has_gat or has_hetero):
+            print("没有可用的损失数据来绘制图表")
+            return
+
+        plt.figure(figsize=(12, 8))
+
+        # 确保目录存在
+        if save_path:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+        # 绘制训练损失
+        plt.subplot(2, 1, 1)
+        if has_mlp:
+            epochs_mlp = range(1, len(self.mlp_train_losses) + 1)
+            plt.plot(epochs_mlp, self.mlp_train_losses, 'b-', label='MLP训练损失')
+        if has_gat:
+            epochs_gat = range(1, len(self.gat_train_losses) + 1)
+            plt.plot(epochs_gat, self.gat_train_losses, 'r-', label='GAT训练损失')
+        if has_hetero:
+            epochs_hetero = range(1, len(self.hetero_train_losses) + 1)
+            plt.plot(epochs_hetero, self.hetero_train_losses,
+                     'g-', label='异构图训练损失')
+
+        plt.title('不同模型训练损失对比')
+        plt.xlabel('轮次')
+        plt.ylabel('损失')
+        plt.legend()
+        plt.grid(True)
+
+        # 绘制验证损失
+        plt.subplot(2, 1, 2)
+        if has_mlp:
+            plt.plot(epochs_mlp, self.mlp_val_losses, 'b-', label='MLP验证损失')
+        if has_gat:
+            plt.plot(epochs_gat, self.gat_val_losses, 'r-', label='GAT验证损失')
+        if has_hetero:
+            plt.plot(epochs_hetero, self.hetero_val_losses,
+                     'g-', label='异构图验证损失')
+
+        plt.title('不同模型验证损失对比')
+        plt.xlabel('轮次')
+        plt.ylabel('损失')
+        plt.legend()
+        plt.grid(True)
+
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path)
+        else:
+            plt.show()
+
 
 def load_and_preprocess_test_data(test_csv_path, scaler_rssi=None, scaler_phase=None):
     """
@@ -1025,6 +1333,9 @@ def run_grid_search(
         heads_range: 注意力头数范围
         quick_search: 是否使用快速搜索（减少组合数量）
         dropout_range: Dropout比率范围
+
+    返回:
+        前三个最佳模型的参数和模型名称
     """
     start_time = time.time()  # 记录开始时间
     # 设置默认搜索范围
@@ -1072,6 +1383,8 @@ def run_grid_search(
     gat_results = []
     # 存储MLP结果
     mlp_results = []
+    # 存储异构图结果
+    hetero_results = []
 
     # 创建所有GAT超参数组合
     gat_param_combinations = list(
@@ -1084,6 +1397,13 @@ def run_grid_search(
     mlp_param_combinations = list(
         itertools.product(
             lr_range, weight_decay_range, hidden_channels_range, dropout_range
+        )
+    )
+
+    # 创建所有异构图超参数组合 (与GAT相同)
+    hetero_param_combinations = list(
+        itertools.product(
+            k_range, lr_range, weight_decay_range, hidden_channels_range, heads_range
         )
     )
 
@@ -1216,9 +1536,65 @@ def run_grid_search(
         print(f"测试集平均误差: {val_avg_distance:.2f}米")
         print(f"验证集平均误差: {test_avg_distance:.2f}米")
 
+    # 执行异构图网格搜索
+    print(f"\n开始异构图网格搜索，共 {len(hetero_param_combinations)} 种组合")
+
+    for i, (k, lr, weight_decay, hidden_channels,
+            heads) in enumerate(hetero_param_combinations):
+        print(f"\n异构图组合 {i+1}/{len(hetero_param_combinations)}:")
+        print(
+            f"K={k}, lr={lr}, weight_decay={weight_decay}, hidden_channels={hidden_channels}, heads={heads}"
+        )
+
+        # 更新配置
+        config = CONFIG.copy()
+        config['K'] = k
+
+        # 初始化定位系统
+        localization = RFIDLocalization(config)
+
+        # 使用最佳MLP模型替换新初始化的MLP模型
+        localization.mlp_model = best_mlp_model
+
+        # 确保标准化器与最佳MLP模型一致
+        localization.scaler_rssi = best_mlp_localization.scaler_rssi
+        localization.scaler_phase = best_mlp_localization.scaler_phase
+        localization.labels_scaler = best_mlp_localization.labels_scaler
+
+        # 直接调用 train_hetero_model 进行训练
+        best_val_avg_distance, best_val_loss = localization.train_hetero_model(
+            hidden_channels=hidden_channels,
+            heads=heads,
+            lr=lr,
+            weight_decay=weight_decay
+        )
+        val_avg_distance = best_val_avg_distance
+
+        # 用测试数据评估异构图模型
+        test_avg_distance = localization.evaluate_prediction_hetero_accuracy(
+            test_data=(test_features_np, test_labels_np),
+            num_samples=len(test_features_np)
+        )
+
+        # 存储结果
+        result = {
+            'K': k,
+            'lr': lr,
+            'weight_decay': weight_decay,
+            'hidden_channels': hidden_channels,
+            'heads': heads,
+            'val_avg_distance': val_avg_distance,
+            'test_avg_distance': test_avg_distance
+        }
+        hetero_results.append(result)
+
+        print(f"测试集平均误差: {val_avg_distance:.2f}米")
+        print(f"验证集平均误差: {test_avg_distance:.2f}米")
+
     # 按验证集平均误差排序
     gat_results.sort(key=lambda x: x['test_avg_distance'])
     mlp_results.sort(key=lambda x: x['test_avg_distance'])
+    hetero_results.sort(key=lambda x: x['test_avg_distance'])
 
     # 输出最佳GAT超参数
     best_gat_result = gat_results[0]
@@ -1239,6 +1615,16 @@ def run_grid_search(
     print(f"Dropout比率: {best_mlp_result['dropout']}")
     print(f"验证集平均误差: {best_mlp_result['test_avg_distance']:.2f}米")
 
+    # 输出最佳异构图超参数
+    best_hetero_result = hetero_results[0]
+    print("\n============ 最佳异构图超参数 ============")
+    print(f"K: {best_hetero_result['K']}")
+    print(f"学习率: {best_hetero_result['lr']}")
+    print(f"权重衰减: {best_hetero_result['weight_decay']}")
+    print(f"隐藏层通道数: {best_hetero_result['hidden_channels']}")
+    print(f"注意力头数: {best_hetero_result['heads']}")
+    print(f"验证集平均误差: {best_hetero_result['test_avg_distance']:.2f}米")
+
     # 将所有结果输出到文件
     gat_results_df = pd.DataFrame(gat_results)
     gat_results_df.to_csv('results/gat_grid_search_results.csv', index=False)
@@ -1246,15 +1632,41 @@ def run_grid_search(
     mlp_results_df = pd.DataFrame(mlp_results)
     mlp_results_df.to_csv('results/mlp_grid_search_results.csv', index=False)
 
+    hetero_results_df = pd.DataFrame(hetero_results)
+    hetero_results_df.to_csv(
+        'results/hetero_grid_search_results.csv', index=False)
+
     print("GAT结果已保存到 gat_grid_search_results.csv")
     print("MLP结果已保存到 mlp_grid_search_results.csv")
+    print("异构图结果已保存到 hetero_grid_search_results.csv")
+
     end_time = time.time()  # 记录结束时间
     total_time = end_time - start_time
     print(f"\n网格搜索总耗时: {total_time:.2f} 秒")
-    # 比较GAT和MLP的最佳结果
-    if best_gat_result['test_avg_distance'] <= best_mlp_result['test_avg_distance']:
-        print("\nGAT模型性能更好!")
-    return best_gat_result
+
+    # 比较所有模型的最佳结果
+    all_results = [
+        ("GAT", best_gat_result['test_avg_distance']),
+        ("MLP", best_mlp_result['test_avg_distance']),
+        ("异构图", best_hetero_result['test_avg_distance'])
+    ]
+    # 按照误差从小到大排序
+    sorted_models = sorted(all_results, key=lambda x: x[1])
+    best_model_name, best_error = sorted_models[0]
+    print(f"\n{best_model_name}模型性能最好，误差: {best_error:.2f}米!")
+
+    # 创建一个包含前三个最佳模型的结果字典
+    best_models_results = {}
+    for model_name, _ in sorted_models:
+        if model_name == "GAT":
+            best_models_results["GAT"] = best_gat_result
+        elif model_name == "MLP":
+            best_models_results["MLP"] = best_mlp_result
+        else:
+            best_models_results["异构图"] = best_hetero_result
+
+    # 返回所有三个模型的参数和排序后的模型名称列表
+    return best_models_results, [model[0] for model in sorted_models]
 
 
 def main():
@@ -1268,7 +1680,7 @@ def main():
         print("执行超参数网格搜索")
 
         # 为了节省时间，可以使用较小的搜索范围
-        best_params = run_grid_search(
+        best_models_results, sorted_model_names = run_grid_search(
             k_range=[5, 6, 7, 8],
             lr_range=[0.001, 0.005, 0.01],
             weight_decay_range=[1e-5, 5e-5, 1e-4, 5e-4],
@@ -1277,96 +1689,159 @@ def main():
             quick_search=CONFIG['QUICK_SEARCH']
         )
 
-        # 使用最佳超参数训练模型并评估
-        print("\n使用最佳超参数训练最终模型")
-        # 更新配置
-        config = CONFIG.copy()
-        config['K'] = best_params['K']
+        # 获取最佳模型类型
+        best_model_type = sorted_model_names[0]  # 最佳模型名称
+        print(f"网格搜索确定的最佳模型类型: {best_model_type}")
+        print(f"所有模型按性能排序: {', '.join(sorted_model_names)}")
     else:
         # 不进行网格搜索，使用默认参数
         print("使用默认超参数训练模型")
-        best_params = {
-            'K': CONFIG['K'],
-            # 'lr': 0.001,
-            # 'weight_decay': 5e-5,
-            # 'hidden_channels': 64,
-            # 'heads': 2
+        best_models_results = {
+            "GAT": {'K': CONFIG['K']},
+            "MLP": {'K': CONFIG['K']},
+            "异构图": {'K': CONFIG['K']}
         }
+        sorted_model_names = ["GAT", "MLP", "异构图"]  # 默认顺序
         config = CONFIG.copy()
-
-    # 初始化定位系统
-    localization = RFIDLocalization(config)
 
     # 确保结果目录存在
     os.makedirs('results', exist_ok=True)
 
-    # 训练并评估MLP模型
-    if config['OPEN_MLP']:
-        localization.train_mlp_model(
-            hidden_channels=best_params.get('hidden_channels', 128),
-            dropout=best_params.get('dropout', 0.2),
-            lr=best_params.get('lr', 0.01),
-            weight_decay=best_params.get('weight_decay', 0.0001)
-        )
-        # 在新数据上评估MLP模型
-        mlp_prediction_error = localization.evaluate_mlp_on_new_data(
-            test_features_np, test_labels_np
-        )
-        print(f"MLP模型在新标签上的平均预测误差: {mlp_prediction_error:.2f}米")
+    # 初始化三个不同配置的定位系统
+    localization_systems = {}
+    errors = {}
 
-    # 训练GAT模型
-    if CONFIG['GRID_SEARCH']:
-        localization.model = GATLocalizationModel(
-            in_channels=localization.features_norm.shape[1],
-            hidden_channels=best_params.get('hidden_channels', 128),
-            out_channels=2,
-            heads=best_params.get('heads', 3)
-        )
+    # 对每个模型分别初始化和训练
+    for model_name in ["MLP", "GAT", "异构图"]:
+        if model_name in best_models_results:
+            print(
+                f"\n=================== 训练{model_name}模型 ===================")
+            # 每个模型使用自己的最佳参数初始化
+            model_params = best_models_results[model_name]
 
-    # 训练并评估GAT模型
-    if config['OPEN_GAT']:
-        best_val_avg_distance, best_val_loss = localization.train_gat_model(
-            hidden_channels=best_params.get('hidden_channels', 128),
-            heads=best_params.get('heads', 3),
-            lr=best_params.get('lr', 0.001),
-            weight_decay=best_params.get('weight_decay', 0.0005)
-        )
-        print(f"GAT模型测试集平均误差: {best_val_avg_distance:.2f}米")
+            # 创建新的配置和定位系统实例
+            config = CONFIG.copy()
+            if 'K' in model_params:
+                config['K'] = model_params['K']
 
-        # 评估GAT模型在新标签预测上的准确性
-        # 设置随机种子以确保可重现性
-        np.random.seed(config['RANDOM_SEED'] + 1)  # 使用不同的种子以避免与训练集重叠
-        gat_prediction_error = localization.evaluate_prediction_GAT_accuracy(
-            test_data=(test_features_np, test_labels_np),
-            num_samples=len(test_features_np)  # 使用所有测试数据
-        )
-        print(f"GAT模型在新标签上的平均预测误差: {gat_prediction_error:.2f}米")
+            localization = RFIDLocalization(config)
+            localization_systems[model_name] = localization
 
-    # 如果MLP和GAT都已训练，则绘制损失对比图
-    if config['OPEN_MLP'] and config['OPEN_GAT']:
-        localization.plot_loss_comparison(
-            save_path='results/loss_comparison.png')
-        # 将损失数据保存到CSV文件中
+            # 根据不同模型类型训练
+            if model_name == "MLP" and config['OPEN_MLP']:
+                best_val_loss, best_val_avg_distance, best_model = localization.train_mlp_model(
+                    hidden_channels=model_params.get('hidden_channels', 128),
+                    dropout=model_params.get('dropout', 0.1),
+                    lr=model_params.get('lr', 0.001),
+                    weight_decay=model_params.get('weight_decay', 0.0005)
+                )
+                # 在新数据上评估MLP模型
+                mlp_prediction_error = localization.evaluate_mlp_on_new_data(
+                    test_features_np, test_labels_np
+                )
+                errors['MLP'] = mlp_prediction_error
+                print(f"MLP模型在新标签上的平均预测误差: {mlp_prediction_error:.2f}米")
 
-    if config['OPEN_KNN']:
-        # 训练和评估KNN模型
-        features_array = localization.features.cpu().numpy()  # 先将数据移到CPU
-        labels_array = localization.labels.cpu().numpy()  # 先将数据移到CPU
-        knn_model = localization.knn_localization(
-            features_array, labels_array, n_neighbors=config['K']
-        )
-        avg_error = localization.evaluate_knn_on_test_set(
-            knn_model, test_features_np, test_labels_np
-        )
-        print(f"KNN模型测试集平均误差: {avg_error:.2f}米")
+            elif model_name == "GAT" and config['OPEN_GAT']:
+                # 创建GAT模型
+                localization.model = GATLocalizationModel(
+                    in_channels=localization.features_norm.shape[1],
+                    hidden_channels=model_params.get('hidden_channels', 64),
+                    out_channels=2,
+                    heads=model_params.get('heads', 3)
+                )
 
-    # 使用LANDMARC算法定位
-    if config['OPEN_LANDMARC']:
-        # 对测试集使用LANDMARC算法
-        _, landmarc_error = localization.landmarc_localization(
-            test_features, test_labels, k=config['K']
-        )
-        print(f"LANDMARC算法测试集平均误差: {landmarc_error:.2f}米")
+                # 训练GAT模型
+                best_val_avg_distance, best_val_loss = localization.train_gat_model(
+                    hidden_channels=model_params.get('hidden_channels', 64),
+                    heads=model_params.get('heads', 3),
+                    lr=model_params.get('lr', 0.005),
+                    weight_decay=model_params.get('weight_decay', 5e-4)
+                )
+
+                # 评估GAT模型
+                np.random.seed(config['RANDOM_SEED'] + 1)
+                gat_prediction_error = localization.evaluate_prediction_GAT_accuracy(
+                    test_data=(test_features_np, test_labels_np),
+                    num_samples=len(test_features_np)
+                )
+                errors['GAT'] = gat_prediction_error
+                print(f"GAT模型在新标签上的平均预测误差: {gat_prediction_error:.2f}米")
+
+            elif model_name == "异构图" and config['OPEN_HETERO']:
+                # 训练异构图模型
+                best_val_avg_distance, best_val_loss = localization.train_hetero_model(
+                    hidden_channels=model_params.get('hidden_channels', 64),
+                    heads=model_params.get('heads', 3),
+                    lr=model_params.get('lr', 0.005),
+                    weight_decay=model_params.get('weight_decay', 5e-4)
+                )
+
+                # 评估异构图模型
+                np.random.seed(config['RANDOM_SEED'] + 2)
+                hetero_prediction_error = localization.evaluate_prediction_hetero_accuracy(
+                    test_data=(test_features_np, test_labels_np),
+                    num_samples=len(test_features_np)
+                )
+                errors['异构图'] = hetero_prediction_error
+                print(f"异构图模型在新标签上的平均预测误差: {hetero_prediction_error:.2f}米")
+
+    # KNN和LANDMARC模型评估
+    if len(localization_systems) > 0:
+        # 使用第一个定位系统来评估KNN和LANDMARC
+        localization = next(iter(localization_systems.values()))
+
+        if config['OPEN_KNN']:
+            # 训练和评估KNN模型
+            features_array = localization.features.cpu().numpy()
+            labels_array = localization.labels.cpu().numpy()
+            knn_model = localization.knn_localization(
+                features_array, labels_array, n_neighbors=config['K']
+            )
+            avg_error = localization.evaluate_knn_on_test_set(
+                knn_model, test_features_np, test_labels_np
+            )
+            errors['KNN'] = avg_error
+            print(f"KNN模型测试集平均误差: {avg_error:.2f}米")
+
+        if config['OPEN_LANDMARC']:
+            # 对测试集使用LANDMARC算法
+            _, landmarc_error = localization.landmarc_localization(
+                test_features, test_labels, k=config['K']
+            )
+            errors['LANDMARC'] = landmarc_error
+            print(f"LANDMARC算法测试集平均误差: {landmarc_error:.2f}米")
+
+    # 打印所有模型的性能比较
+    if errors:
+        print("\n======= 所有模型性能比较 =======")
+        # 按照误差从小到大排序
+        sorted_errors = sorted(errors.items(), key=lambda x: x[1])
+        for i, (model, error) in enumerate(sorted_errors):
+            print(f"{i+1}. {model}: {error:.2f}米")
+
+        # 找出性能最好的模型
+        best_model = sorted_errors[0][0]
+        print(f"\n实际测试中性能最佳的模型是: {best_model}")
+
+        # 绘制损失对比图
+        models_trained = [model for model in [
+            "MLP", "GAT", "异构图"] if model in localization_systems]
+        if len(models_trained) >= 2 and len(localization_systems) >= 2:
+            print(f"\n绘制模型损失比较图: {', '.join(models_trained)}")
+            # 使用第一个定位系统进行绘图
+            first_localization = next(iter(localization_systems.values()))
+            first_localization.plot_all_models_loss_comparison(
+                save_path='results/all_models_loss_comparison.png'
+            )
+
+        # 如果网格搜索确定了最佳模型类型，与实际测试结果进行比较
+        if CONFIG['GRID_SEARCH'] and sorted_model_names:
+            if sorted_model_names[0] == best_model:
+                print(f"网格搜索结果与实际测试结果一致，都为{best_model}模型")
+            else:
+                print(
+                    f"网格搜索结果({sorted_model_names[0]})与实际测试结果({best_model})不一致")
 
 
 if __name__ == "__main__":
