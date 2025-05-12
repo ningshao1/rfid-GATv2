@@ -15,7 +15,7 @@ CONFIG = {
     'OPEN_MLP': True,  # 启用MLP算法进行比较
     'OPEN_GAT': True,  # 启用GAT算法进行比较
     'OPEN_HETERO': True,  # 启用异构图算法进行比较
-    'DATA_AUGMENTATION': True,  # 是否启用数据增强
+    'DATA_AUGMENTATION': False,  # 是否启用数据增强
     'OPEN_LANDMARC': True,  # 启用LANDMARC算法进行比较
 
     # 天线位置坐标

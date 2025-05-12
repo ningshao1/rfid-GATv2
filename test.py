@@ -364,6 +364,7 @@ class RFIDLocalization:
 
         # 确保MLP模型已训练，用于初始估计
         if self.mlp_model is None:
+            print("mlp_model为空")
             self.train_mlp_model()
 
         # 标准化天线位置
@@ -586,64 +587,54 @@ def main():
     # 确保结果目录存在
     os.makedirs(CONFIG['RESULTS_DIR'], exist_ok=True)
 
-    # 初始化一个共享的定位系统用于绘制损失图
+    # 初始化一个共享的定位系统
     # 创建一个基础配置
     base_config = CONFIG.copy()
-    # 使用共享的定位系统实例来收集所有模型的损失数据
+    # 使用共享的定位系统实例来训练所有模型
     shared_localization = RFIDLocalization(base_config)
 
-    # 初始化三个不同配置的定位系统
-    localization_systems = {}
+    # 存储错误信息的字典
     errors = {}
 
-    # 对每个模型分别初始化和训练
+    # 对每个模型分别训练
     for model_name in ["MLP", "GAT", "异构图"]:
         if model_name in best_models_results:
             print(f"\n=================== 训练{model_name}模型 ===================")
-            # 每个模型使用自己的最佳参数初始化
+            # 每个模型使用自己的最佳参数
             model_params = best_models_results[model_name]
 
-            # 创建新的配置和定位系统实例
-            config = CONFIG.copy()
+            # 更新配置中的K参数
             if 'K' in model_params:
-                config['K'] = model_params['K']
-
-            localization = RFIDLocalization(config)
-            localization_systems[model_name] = localization
+                shared_localization.config['K'] = model_params['K']
 
             # 根据不同模型类型训练
-            if model_name == "MLP" and config['OPEN_MLP']:
+            if model_name == "MLP" and shared_localization.config['OPEN_MLP']:
                 print("训练MLP参数：", model_params)
 
-                best_val_loss, best_val_avg_distance, best_model = localization.train_mlp_model(
+                best_val_loss, best_val_avg_distance, best_model = shared_localization.train_mlp_model(
                     hidden_channels=model_params.get('hidden_channels', 128),
                     dropout=model_params.get('dropout', 0.1),
                     lr=model_params.get('lr', 0.001),
                     weight_decay=model_params.get('weight_decay', 0.0005)
                 )
                 # 在新数据上评估MLP模型
-                mlp_prediction_error = localization.evaluate_mlp_on_new_data(
+                mlp_prediction_error = shared_localization.evaluate_mlp_on_new_data(
                     test_features_np, test_labels_np
                 )
                 errors['MLP'] = mlp_prediction_error
                 print(f"MLP模型在新标签上的平均预测误差: {mlp_prediction_error:.2f}米")
 
-                # 将MLP的损失数据复制到共享定位系统
-                shared_localization.mlp_train_losses = localization.mlp_train_losses.copy(
-                )
-                shared_localization.mlp_val_losses = localization.mlp_val_losses.copy()
-
-            elif model_name == "GAT" and config['OPEN_GAT']:
+            elif model_name == "GAT" and shared_localization.config['OPEN_GAT']:
                 # 创建GAT模型
-                localization.model = GATLocalizationModel(
-                    in_channels=localization.features_norm.shape[1],
+                shared_localization.model = GATLocalizationModel(
+                    in_channels=shared_localization.features_norm.shape[1],
                     hidden_channels=model_params.get('hidden_channels', 64),
                     out_channels=2,
                     heads=model_params.get('heads', 3)
                 )
 
                 # 训练GAT模型
-                best_val_avg_distance, best_val_loss = localization.train_gat_model(
+                best_val_avg_distance, best_val_loss = shared_localization.train_gat_model(
                     hidden_channels=model_params.get('hidden_channels', 64),
                     heads=model_params.get('heads', 3),
                     lr=model_params.get('lr', 0.005),
@@ -651,22 +642,17 @@ def main():
                 )
 
                 # 评估GAT模型
-                np.random.seed(config['RANDOM_SEED'])
-                gat_prediction_error = localization.evaluate_prediction_GAT_accuracy(
+                np.random.seed(shared_localization.config['RANDOM_SEED'])
+                gat_prediction_error = shared_localization.evaluate_prediction_GAT_accuracy(
                     test_data=(test_features_np, test_labels_np),
                     num_samples=len(test_features_np)
                 )
                 errors['GAT'] = gat_prediction_error
                 print(f"GAT模型在新标签上的平均预测误差: {gat_prediction_error:.2f}米")
 
-                # 将GAT的损失数据复制到共享定位系统
-                shared_localization.gat_train_losses = localization.gat_train_losses.copy(
-                )
-                shared_localization.gat_val_losses = localization.gat_val_losses.copy()
-
-            elif model_name == "异构图" and config['OPEN_HETERO']:
+            elif model_name == "异构图" and shared_localization.config['OPEN_HETERO']:
                 # 训练异构图模型
-                best_val_avg_distance, best_val_loss = localization.train_hetero_model(
+                best_val_avg_distance, best_val_loss = shared_localization.train_hetero_model(
                     hidden_channels=model_params.get('hidden_channels', 64),
                     heads=model_params.get('heads', 3),
                     lr=model_params.get('lr', 0.005),
@@ -674,58 +660,49 @@ def main():
                 )
 
                 # 评估异构图模型
-                np.random.seed(config['RANDOM_SEED'])
-                hetero_prediction_error = localization.evaluate_prediction_hetero_accuracy(
+                np.random.seed(shared_localization.config['RANDOM_SEED'])
+                hetero_prediction_error = shared_localization.evaluate_prediction_hetero_accuracy(
                     test_data=(test_features_np, test_labels_np),
                     num_samples=len(test_features_np)
                 )
                 errors['异构图'] = hetero_prediction_error
                 print(f"异构图模型在新标签上的平均预测误差: {hetero_prediction_error:.2f}米")
 
-                # 将异构图的损失数据复制到共享定位系统
-                shared_localization.hetero_train_losses = localization.hetero_train_losses.copy(
-                )
-                shared_localization.hetero_val_losses = localization.hetero_val_losses.copy(
-                )
-
     # KNN和LANDMARC模型评估
-    if len(localization_systems) > 0:
-        # 使用第一个定位系统来评估KNN和LANDMARC
-        localization = next(iter(localization_systems.values()))
+    # 直接使用shared_localization进行评估
+    if shared_localization.config['OPEN_KNN']:
+        # 训练和评估KNN模型
+        features_array = shared_localization.features.cpu().numpy()
+        labels_array = shared_localization.labels.cpu().numpy()
 
-        if config['OPEN_KNN']:
-            # 训练和评估KNN模型
-            features_array = localization.features.cpu().numpy()
-            labels_array = localization.labels.cpu().numpy()
+        # 直接调用导入的knn_localization函数
+        knn_model = knn_localization(
+            features_array, labels_array, n_neighbors=shared_localization.config['K']
+        )
 
-            # 直接调用导入的knn_localization函数
-            knn_model = knn_localization(
-                features_array, labels_array, n_neighbors=config['K']
-            )
+        # 直接调用导入的evaluate_knn_on_test_set函数
+        avg_error = evaluate_knn_on_test_set(
+            knn_model, test_features_np, test_labels_np
+        )
+        errors['KNN'] = avg_error
+        print(f"KNN模型测试集平均误差: {avg_error:.2f}米")
 
-            # 直接调用导入的evaluate_knn_on_test_set函数
-            avg_error = evaluate_knn_on_test_set(
-                knn_model, test_features_np, test_labels_np
-            )
-            errors['KNN'] = avg_error
-            print(f"KNN模型测试集平均误差: {avg_error:.2f}米")
+    if shared_localization.config['OPEN_LANDMARC']:
+        # 对测试集使用LANDMARC算法
+        # 提取参考标签的特征和位置
+        reference_features = shared_localization.features
+        reference_locations = shared_localization.labels
 
-        if config['OPEN_LANDMARC']:
-            # 对测试集使用LANDMARC算法
-            # 提取参考标签的特征和位置
-            reference_features = localization.features
-            reference_locations = localization.labels
-
-            # 直接调用导入的landmarc_localization函数
-            _, landmarc_error = landmarc_localization(
-                reference_features,
-                reference_locations,
-                test_features,
-                test_labels,
-                k=config['K']
-            )
-            errors['LANDMARC'] = landmarc_error
-            print(f"LANDMARC算法测试集平均误差: {landmarc_error:.2f}米")
+        # 直接调用导入的landmarc_localization函数
+        _, landmarc_error = landmarc_localization(
+            reference_features,
+            reference_locations,
+            test_features,
+            test_labels,
+            k=shared_localization.config['K']
+        )
+        errors['LANDMARC'] = landmarc_error
+        print(f"LANDMARC算法测试集平均误差: {landmarc_error:.2f}米")
 
     # 打印所有模型的性能比较
     if errors:
