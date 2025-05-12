@@ -19,6 +19,8 @@ from torch_geometric.nn import GATv2Conv
 import itertools
 import time
 import os
+import logging
+from datetime import datetime
 
 # 导入配置
 from config import CONFIG
@@ -57,6 +59,32 @@ class RFIDLocalization:
         self.config = config or CONFIG
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.set_random_seed()
+
+        # 设置日志
+        os.makedirs('log', exist_ok=True)
+        self.log_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # 训练日志
+        if self.config['TRAIN_LOG']:
+            self.train_logger = logging.getLogger('train_log')
+            self.train_logger.setLevel(logging.INFO)
+            train_handler = logging.FileHandler(
+                f'log/train_{self.log_time}.log', encoding='utf-8'
+            )
+            train_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+            self.train_logger.addHandler(train_handler)
+
+        # 预测日志
+        if self.config['PREDICTION_LOG']:
+            self.prediction_logger = logging.getLogger('prediction_log')
+            self.prediction_logger.setLevel(logging.INFO)
+            prediction_handler = logging.FileHandler(
+                f'log/prediction_{self.log_time}.log', encoding='utf-8'
+            )
+            prediction_handler.setFormatter(
+                logging.Formatter('%(asctime)s - %(message)s')
+            )
+            self.prediction_logger.addHandler(prediction_handler)
 
         # 数据占位符
         self.df = None
@@ -259,17 +287,20 @@ class RFIDLocalization:
 
             distances = np.sqrt(np.sum((predictions_np - test_labels_np)**2, axis=1))
 
-            print("\nLANDMARC算法位置预测评估:")
-            print(f"测试样本数量: {len(test_features)}")
-            print(f"平均预测误差: {avg_error:.2f}米")
-            print(f"最大误差: {np.max(distances):.2f}米")
-            print(f"最小误差: {np.min(distances):.2f}米")
-            print(f"误差标准差: {np.std(distances):.2f}米")
+            log_message = "\nLANDMARC算法位置预测评估:\n"
+            log_message += f"测试样本数量: {len(test_features)}\n"
+            log_message += f"平均预测误差: {avg_error:.2f}米\n"
+            log_message += f"最大误差: {np.max(distances):.2f}米\n"
+            log_message += f"最小误差: {np.min(distances):.2f}米\n"
+            log_message += f"误差标准差: {np.std(distances):.2f}米\n"
 
             # 计算不同误差阈值下的准确率
             for threshold in [0.5, 1.0, 1.5, 2.0]:
                 accuracy = np.mean(distances < threshold) * 100
-                print(f"误差 < {threshold}米的准确率: {accuracy:.2f}%")
+                log_message += f"误差 < {threshold}米的准确率: {accuracy:.2f}%\n"
+
+            # 打印到控制台并写入日志
+            self.prediction_logger.info(log_message)
 
         return predictions, avg_error
 
@@ -302,6 +333,7 @@ class RFIDLocalization:
         )
 
         # 调用heterogeneous模块中的训练函数
+        self.config['RFID_INSTANCE'] = self  # 添加实例的引用
         best_val_avg_distance, best_val_loss, self.hetero_model, train_losses, val_losses = train_hetero_model_func(
             self.features_norm,
             self.labels_norm,
@@ -456,17 +488,20 @@ class RFIDLocalization:
         avg_distance = torch.mean(distances).item()
 
         if self.config['PREDICTION_LOG']:
-            print("\n异构图模型新标签位置预测评估:")
-            print(f"测试样本数量: {len(test_features)}")
-            print(f"平均预测误差: {avg_distance:.2f}米")
-            print(f"最大误差: {torch.max(distances).item():.2f}米")
-            print(f"最小误差: {torch.min(distances).item():.2f}米")
-            print(f"误差标准差: {torch.std(distances).item():.2f}米")
+            log_message = "\n异构图模型新标签位置预测评估:\n"
+            log_message += f"测试样本数量: {len(test_features)}\n"
+            log_message += f"平均预测误差: {avg_distance:.2f}米\n"
+            log_message += f"最大误差: {torch.max(distances).item():.2f}米\n"
+            log_message += f"最小误差: {torch.min(distances).item():.2f}米\n"
+            log_message += f"误差标准差: {torch.std(distances).item():.2f}米\n"
 
             # 计算不同误差阈值下的准确率
             for threshold in [0.5, 1.0, 1.5, 2.0]:
                 accuracy = (distances < threshold).float().mean().item() * 100
-                print(f"误差 < {threshold}米的准确率: {accuracy:.2f}%")
+                log_message += f"误差 < {threshold}米的准确率: {accuracy:.2f}%\n"
+
+            # 打印到控制台并写入日志
+            self.prediction_logger.info(log_message)
 
         return avg_distance
 
@@ -686,6 +721,28 @@ def main():
         )
         errors['KNN'] = avg_error
         print(f"KNN模型测试集平均误差: {avg_error:.2f}米")
+
+        # 记录详细的KNN评估日志
+        if shared_localization.config['PREDICTION_LOG']:
+            # 预测测试集
+            predictions = knn_model.predict(test_features_np)
+            # 计算实际米数的误差
+            distances = np.sqrt(np.sum((test_labels_np - predictions)**2, axis=1))
+
+            log_message = "\nKNN模型位置预测评估:\n"
+            log_message += f"测试样本数量: {len(test_features_np)}\n"
+            log_message += f"平均预测误差: {avg_error:.2f}米\n"
+            log_message += f"最大误差: {np.max(distances):.2f}米\n"
+            log_message += f"最小误差: {np.min(distances):.2f}米\n"
+            log_message += f"误差标准差: {np.std(distances):.2f}米\n"
+
+            # 计算不同误差阈值下的准确率
+            for threshold in [0.5, 1.0, 1.5, 2.0]:
+                accuracy = np.mean(distances < threshold) * 100
+                log_message += f"误差 < {threshold}米的准确率: {accuracy:.2f}%\n"
+
+            # 打印到控制台并写入日志
+            shared_localization.prediction_logger.info(log_message)
 
     if shared_localization.config['OPEN_LANDMARC']:
         # 对测试集使用LANDMARC算法

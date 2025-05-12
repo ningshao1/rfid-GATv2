@@ -105,17 +105,23 @@ def train_gat_model(
             counter += 1
             if counter >= patience:
                 if localization.config['TRAIN_LOG']:
-                    print(
-                        f"轮次 {epoch}\n训练集 - 损失: {train_loss.item():.4f}, 准确率: {train_accuracy:.2f}%, 平均误差: {train_avg_distance:.2f}米\n验证集 - 损失: {val_loss.item():.4f}, 准确率: {val_accuracy:.2f}%, 平均误差: {val_avg_distance:.2f}米"
+                    log_message = (
+                        f"轮次 {epoch}\n"
+                        f"训练集 - 损失: {train_loss.item():.4f}, 准确率: {train_accuracy:.2f}%, 平均误差: {train_avg_distance:.2f}米\n"
+                        f"验证集 - 损失: {val_loss.item():.4f}, 准确率: {val_accuracy:.2f}%, 平均误差: {val_avg_distance:.2f}米\n"
+                        f"\n触发早停！在轮次 {epoch} 停止训练\n"
+                        f"最佳验证损失: {best_val_loss:.4f}"
                     )
-                    print(f"\n触发早停！在轮次 {epoch} 停止训练")
-                    print(f"最佳验证损失: {best_val_loss:.4f}")
+                    localization.train_logger.info(log_message)
                 localization.model.load_state_dict(best_model)
                 break
         if epoch % 100 == 0 and localization.config['TRAIN_LOG']:
-            print(
-                f"轮次 {epoch}\n训练集 - 损失: {train_loss.item():.4f}, 准确率: {train_accuracy:.2f}%, 平均误差: {train_avg_distance:.2f}米\n验证集 - 损失: {val_loss.item():.4f}, 准确率: {val_accuracy:.2f}%, 平均误差: {val_avg_distance:.2f}米"
+            log_message = (
+                f"轮次 {epoch}\n"
+                f"训练集 - 损失: {train_loss.item():.4f}, 准确率: {train_accuracy:.2f}%, 平均误差: {train_avg_distance:.2f}米\n"
+                f"验证集 - 损失: {val_loss.item():.4f}, 准确率: {val_accuracy:.2f}%, 平均误差: {val_avg_distance:.2f}米"
             )
+            localization.train_logger.info(log_message)
     return best_val_avg_distance, best_val_loss.item()
 
 
@@ -175,6 +181,25 @@ def evaluate_prediction_GAT_accuracy(localization, test_data=None, num_samples=5
         torch.sum((test_labels - predicted_positions_orig)**2, dim=1)
     )
     avg_distance = torch.mean(distances).item()
+
+    # 添加预测日志记录
+    if localization.config['PREDICTION_LOG']:
+        log_message = "\nGAT模型新标签位置预测评估:\n"
+        log_message += f"测试样本数量: {len(test_features)}\n"
+        log_message += f"平均预测误差: {avg_distance:.2f}米\n"
+        log_message += f"最大误差: {torch.max(distances).item():.2f}米\n"
+        log_message += f"最小误差: {torch.min(distances).item():.2f}米\n"
+        log_message += f"误差标准差: {torch.std(distances).item():.2f}米\n"
+
+        # 计算不同误差阈值下的准确率
+        for threshold in [0.5, 1.0, 1.5, 2.0]:
+            accuracy = (distances < threshold).float().mean().item() * 100
+            log_message += f"误差 < {threshold}米的准确率: {accuracy:.2f}%\n"
+
+        # 打印到控制台并写入日志
+
+        localization.prediction_logger.info(log_message)
+
     return avg_distance
 
 

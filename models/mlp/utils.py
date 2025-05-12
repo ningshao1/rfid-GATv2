@@ -43,7 +43,9 @@ def train_mlp_model(
             X[train_mask], y[train_mask], localization.device
         )
         if localization.config['TRAIN_LOG']:
-            print(f"使用数据增强: 原始样本数 {len(X[train_mask])}, 增强后样本数 {len(X_train_tensor)}")
+            log_message = f"使用数据增强: 原始样本数 {len(X[train_mask])}, 增强后样本数 {len(X_train_tensor)}"
+
+            localization.train_logger.info(log_message)
     else:
         X_train_tensor = X[train_mask]
         y_train_tensor = y[train_mask]
@@ -122,21 +124,24 @@ def train_mlp_model(
             counter += 1
             if counter >= patience:
                 if localization.config['TRAIN_LOG']:
-                    print(
+                    log_message = (
                         f"MLP轮次 {epoch}\n"
-                        f"验证集 - 损失: {val_loss.item():.4f}, 准确率: {val_accuracy:.2f}%, 平均误差: {val_avg_distance:.2f}米"
+                        f"验证集 - 损失: {val_loss.item():.4f}, 准确率: {val_accuracy:.2f}%, 平均误差: {val_avg_distance:.2f}米\n"
+                        f"\n触发早停！在轮次 {epoch} 停止训练\n"
+                        f"最佳验证损失: {best_val_loss:.4f}"
                     )
-                    print(f"\n触发早停！在轮次 {epoch} 停止训练")
-                    print(f"最佳验证损失: {best_val_loss:.4f}")
+                    localization.train_logger.info(log_message)
                 localization.mlp_model.load_state_dict(best_model)
                 break
 
         if epoch % 100 == 0 and localization.config['TRAIN_LOG']:
-            print(
+            log_message = (
                 f"MLP轮次 {epoch}\n"
                 f"训练集 - 损失: {train_loss.item():.4f}\n"
                 f"验证集 - 损失: {val_loss.item():.4f}, 准确率: {val_accuracy:.2f}%, 平均误差: {val_avg_distance:.2f}米"
             )
+
+            localization.train_logger.info(log_message)
 
     # 训练结束后加载最佳模型
     localization.mlp_model.load_state_dict(best_model)
@@ -186,16 +191,20 @@ def evaluate_mlp_on_new_data(localization, test_features, test_labels):
         avg_distance = np.mean(distances)
 
     if localization.config['PREDICTION_LOG']:
-        print("\nMLP模型新标签位置预测评估:")
-        print(f"测试样本数量: {len(test_features)}")
-        print(f"平均预测误差: {avg_distance:.2f}米")
-        print(f"最大误差: {np.max(distances):.2f}米")
-        print(f"最小误差: {np.min(distances):.2f}米")
-        print(f"误差标准差: {np.std(distances):.2f}米")
+        log_message = "\nMLP模型新标签位置预测评估:\n"
+        log_message += f"测试样本数量: {len(test_features)}\n"
+        log_message += f"平均预测误差: {avg_distance:.2f}米\n"
+        log_message += f"最大误差: {np.max(distances):.2f}米\n"
+        log_message += f"最小误差: {np.min(distances):.2f}米\n"
+        log_message += f"误差标准差: {np.std(distances):.2f}米\n"
 
         # 计算不同误差阈值下的准确率
         for threshold in [0.5, 1.0, 1.5, 2.0]:
             accuracy = np.mean(distances < threshold) * 100
-            print(f"误差 < {threshold}米的准确率: {accuracy:.2f}%")
+            log_message += f"误差 < {threshold}米的准确率: {accuracy:.2f}%\n"
+
+        # 打印到控制台并写入日志
+
+        localization.prediction_logger.info(log_message)
 
     return avg_distance

@@ -180,24 +180,33 @@ def train_hetero_model(
             counter += 1
             if counter >= patience:
                 if config.get('TRAIN_LOG', False):
-                    print(
+                    # 使用RFIDLocalization实例通过传入的config获取
+                    rfid_instance = config.get('RFID_INSTANCE', None)
+                    log_message = (
                         f"异构图模型轮次 {epoch}\n"
                         f"训练集 - 损失: {train_loss.item():.4f}, 准确率: {train_accuracy:.2f}%, 平均误差: {train_avg_distance:.2f}米\n"
-                        f"验证集 - 损失: {val_loss.item():.4f}, 准确率: {val_accuracy:.2f}%, 平均误差: {val_avg_distance:.2f}米"
+                        f"验证集 - 损失: {val_loss.item():.4f}, 准确率: {val_accuracy:.2f}%, 平均误差: {val_avg_distance:.2f}米\n"
+                        f"\n触发早停！在轮次 {epoch} 停止训练\n"
+                        f"最佳验证损失: {best_val_loss:.4f}"
                     )
-                    print(f"\n触发早停！在轮次 {epoch} 停止训练")
-                    print(f"最佳验证损失: {best_val_loss:.4f}")
+
+                    if rfid_instance and hasattr(rfid_instance, 'train_logger'):
+                        rfid_instance.train_logger.info(log_message)
 
                 # 加载最佳模型
                 hetero_model.load_state_dict(best_model)
                 break
 
         if epoch % 100 == 0 and config.get('TRAIN_LOG', False):
-            print(
+            rfid_instance = config.get('RFID_INSTANCE', None)
+            log_message = (
                 f"异构图模型轮次 {epoch}\n"
                 f"训练集 - 损失: {train_loss.item():.4f}, 准确率: {train_accuracy:.2f}%, 平均误差: {train_avg_distance:.2f}米\n"
                 f"验证集 - 损失: {val_loss.item():.4f}, 准确率: {val_accuracy:.2f}%, 平均误差: {val_avg_distance:.2f}米"
             )
+
+            if rfid_instance and hasattr(rfid_instance, 'train_logger'):
+                rfid_instance.train_logger.info(log_message)
 
     return best_val_avg_distance, best_val_loss.item(
     ), hetero_model, train_losses, val_losses
