@@ -6,7 +6,7 @@ RFID定位系统配置文件
 # 基本配置
 CONFIG = {
     'K': 7,  # KNN的K值
-    'RANDOM_SEED': 32,  # 随机种子
+    'RANDOM_SEED': 32,  # 随机种子，改为更稳定的值
     'OPEN_KNN': True,  # 启用KNN算法进行比较
     'TRAIN_LOG': False,  # 启用训练日志
     'PREDICTION_LOG': False,  # 启用预测日志
@@ -70,5 +70,12 @@ CONFIG = {
 
     # 结果保存路径
     'RESULTS_DIR': 'results',
-    'MODEL_COMPARISON_IMAGE': 'results/all_models_loss_comparison.png'
+    'MODEL_COMPARISON_IMAGE': 'results/all_models_loss_comparison.png',
+
+    # 边属性权重配置
+    'EDGE_ATTR_WEIGHTS': {
+        'w1': 0.7,  # 距离影响权重增加
+        'w2': 0.2,  # RSSI影响权重增加
+        'w3': 0.1,  # 材质和大小影响权重降低，减少椅子材质的影响
+    }
 }

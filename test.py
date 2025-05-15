@@ -42,6 +42,7 @@ from models.utils.grid_search import run_grid_search
 # 忽略警告
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message="The verbose parameter is deprecated")
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print("device:", device)
@@ -332,6 +333,43 @@ class RFIDLocalization:
             ), self.device
         )
 
+        # 创建椅子信息列表
+        chair_info = [
+            {
+                'type': '椅子',
+                'position': (6, 6),
+                'size': 0.8,
+                'material': 'wood'
+            },
+            {
+                'type': '桌子',
+                'position': (4, 4),
+                'size': 1.5,
+                'material': 'wood'
+            },
+            {
+                'type': '金属架',
+                'position': (8, 2),
+                'size': 1.2,
+                'material': 'metal'
+            },
+            {
+                'type': '电脑',
+                'position': (2, 7),
+                'size': 0.7,
+                'material': 'electronic'
+            },
+            {
+                'type': '柜子',
+                'position': (7, 8),
+                'size': 1.0,
+                'material': 'wood'
+            },
+        ]
+
+        # 添加边属性权重配置
+        edge_attr_weights = self.config['EDGE_ATTR_WEIGHTS']
+
         # 调用heterogeneous模块中的训练函数
         self.config['RFID_INSTANCE'] = self  # 添加实例的引用
         best_val_avg_distance, best_val_loss, self.hetero_model, train_losses, val_losses = train_hetero_model_func(
@@ -347,7 +385,9 @@ class RFIDLocalization:
             hidden_channels=hidden_channels,
             heads=heads,
             lr=lr,
-            weight_decay=weight_decay
+            weight_decay=weight_decay,
+            chair_info=chair_info,
+            edge_attr_weights=edge_attr_weights
         )
 
         # 保存损失记录
@@ -369,6 +409,15 @@ class RFIDLocalization:
         """
         if self.hetero_model is None:
             raise ValueError("异构图模型未训练。请先调用train_hetero_model。")
+
+        # 设置随机种子确保可重复性
+        np.random.seed(self.config['RANDOM_SEED'])
+        torch.manual_seed(self.config['RANDOM_SEED'])
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(self.config['RANDOM_SEED'])
+            torch.cuda.manual_seed_all(self.config['RANDOM_SEED'])
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
 
         if test_data is None:
             raise ValueError("必须提供 test_data 参数，不能为 None")
@@ -396,7 +445,7 @@ class RFIDLocalization:
 
         # 确保MLP模型已训练，用于初始估计
         if self.mlp_model is None:
-            print("mlp_model为空")
+            print("mlp_model为空，开始训练MLP模型进行初始估计")
             self.train_mlp_model()
 
         # 标准化天线位置
@@ -420,12 +469,25 @@ class RFIDLocalization:
 
             # 使用add_new_node_to_hetero_graph添加新节点
             # 首先创建初始异构图
+            # 添加椅子信息列表
+            chair_info = [{
+                'type': '椅子',
+                'position': (6, 6),
+                'size': 0.8,
+                'material': 'wood'
+            }]
+
+            # 添加边属性权重配置
+            edge_attr_weights = self.config['EDGE_ATTR_WEIGHTS']
+
             full_hetero_data = create_heterogeneous_graph_data(
                 self.features_norm,
                 self.labels_norm,
                 antenna_locations_norm,
                 k=self.config['K'],
-                device=self.device
+                device=self.device,
+                chair_info=chair_info,
+                edge_attr_weights=edge_attr_weights
             )
 
             # 添加新节点
@@ -434,7 +496,8 @@ class RFIDLocalization:
                 sample_features,
                 temp_labels,
                 k=self.config['K'],
-                device=self.device
+                device=self.device,
+                edge_attr_weights=edge_attr_weights
             )
 
             # 准备edge_index和edge_attr字典
@@ -454,11 +517,47 @@ class RFIDLocalization:
                     new_hetero_data['antenna', 'to', 'tag'].edge_attr
             }
 
+            # 如果图中存在椅子相关的边，将其添加到字典中
+            if 'chair' in new_hetero_data:
+                # 椅子-标签边
+                if ('tag', 'to', 'chair') in new_hetero_data:
+                    edge_index_dict[('tag', 'to', 'chair')
+                                   ] = new_hetero_data['tag', 'to', 'chair'].edge_index
+                    edge_attr_dict[('tag', 'to', 'chair')
+                                  ] = new_hetero_data['tag', 'to', 'chair'].edge_attr
+
+                if ('chair', 'to', 'tag') in new_hetero_data:
+                    edge_index_dict[('chair', 'to', 'tag')
+                                   ] = new_hetero_data['chair', 'to', 'tag'].edge_index
+                    edge_attr_dict[('chair', 'to', 'tag')
+                                  ] = new_hetero_data['chair', 'to', 'tag'].edge_attr
+
+                # 椅子-天线边
+                if ('chair', 'to', 'antenna') in new_hetero_data:
+                    edge_index_dict[('chair', 'to', 'antenna')
+                                   ] = new_hetero_data['chair', 'to',
+                                                       'antenna'].edge_index
+                    edge_attr_dict[('chair', 'to', 'antenna')
+                                  ] = new_hetero_data['chair', 'to',
+                                                      'antenna'].edge_attr
+
+                if ('antenna', 'to', 'chair') in new_hetero_data:
+                    edge_index_dict[('antenna', 'to', 'chair')
+                                   ] = new_hetero_data['antenna', 'to',
+                                                       'chair'].edge_index
+                    edge_attr_dict[('antenna', 'to', 'chair')
+                                  ] = new_hetero_data['antenna', 'to',
+                                                      'chair'].edge_attr
+
             # 准备节点特征字典
             x_dict = {
                 'tag': new_hetero_data['tag'].x,
                 'antenna': new_hetero_data['antenna'].x
             }
+
+            # 如果图中存在椅子节点，添加到特征字典
+            if 'chair' in new_hetero_data:
+                x_dict['chair'] = new_hetero_data['chair'].x
 
             # 使用异构图模型进行预测
             self.hetero_model.eval()
