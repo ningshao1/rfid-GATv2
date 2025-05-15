@@ -10,8 +10,8 @@ CONFIG = {
     'OPEN_KNN': True,  # 启用KNN算法进行比较
     'TRAIN_LOG': False,  # 启用训练日志
     'PREDICTION_LOG': False,  # 启用预测日志
-    'GRID_SEARCH': False,  # 是否启用网格搜索
-    'QUICK_SEARCH': True,  # 是否使用快速搜索（减少组合数量）
+    'GRID_SEARCH': True,  # 是否启用网格搜索
+    'QUICK_SEARCH': False,  # 是否使用快速搜索（减少组合数量）
     'OPEN_MLP': True,  # 启用MLP算法进行比较
     'OPEN_GAT': True,  # 启用GAT算法进行比较
     'OPEN_HETERO': True,  # 启用异构图算法进行比较
