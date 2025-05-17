@@ -118,6 +118,7 @@ def run_grid_search(
     best_mlp_model = None
     best_mlp_localization = None
     best_mlp_val_avg_distance = float('inf')
+    all_results = []
 
     # 执行MLP网格搜索
     for i, (lr, weight_decay, hidden_channels,
@@ -173,131 +174,133 @@ def run_grid_search(
         best_mlp_localization.train_mlp_model()
     else:
         print(f"\n找到最佳MLP模型，验证集平均误差: {best_mlp_val_avg_distance:.2f}米")
-        print("最佳参数：", best_result)
+        print("MLP最佳参数：", best_result)
 
-    print(f"\n开始GAT网格搜索，共 {len(gat_param_combinations)} 种组合")
+    if config['OPEN_GAT']:
+        print(f"\n开始GAT网格搜索，共 {len(gat_param_combinations)} 种组合")
+        # 执行GAT网格搜索，使用最佳MLP模型
+        for i, (k, lr, weight_decay, hidden_channels,
+                heads) in enumerate(gat_param_combinations):
+            print(f"\nGAT组合 {i+1}/{len(gat_param_combinations)}:")
+            print(
+                f"K={k}, lr={lr}, weight_decay={weight_decay}, hidden_channels={hidden_channels}, heads={heads}"
+            )
 
-    # 执行GAT网格搜索，使用最佳MLP模型
-    for i, (k, lr, weight_decay, hidden_channels,
-            heads) in enumerate(gat_param_combinations):
-        print(f"\nGAT组合 {i+1}/{len(gat_param_combinations)}:")
-        print(
-            f"K={k}, lr={lr}, weight_decay={weight_decay}, hidden_channels={hidden_channels}, heads={heads}"
-        )
+            # 更新配置
+            current_config = config.copy()
+            current_config['K'] = k
 
-        # 更新配置
-        current_config = config.copy()
-        current_config['K'] = k
+            # 初始化定位系统
+            localization = RFIDLocalization(current_config)
 
-        # 初始化定位系统
-        localization = RFIDLocalization(current_config)
+            # 使用最佳MLP模型替换新初始化的MLP模型
+            localization.mlp_model = best_mlp_model
 
-        # 使用最佳MLP模型替换新初始化的MLP模型
-        localization.mlp_model = best_mlp_model
+            # 确保标准化器与最佳MLP模型一致
+            localization.scaler_rssi = best_mlp_localization.scaler_rssi
+            localization.scaler_phase = best_mlp_localization.scaler_phase
+            localization.labels_scaler = best_mlp_localization.labels_scaler
 
-        # 确保标准化器与最佳MLP模型一致
-        localization.scaler_rssi = best_mlp_localization.scaler_rssi
-        localization.scaler_phase = best_mlp_localization.scaler_phase
-        localization.labels_scaler = best_mlp_localization.labels_scaler
+            # 直接调用 train_gat_model 进行训练和测试
+            best_val_avg_distance, best_val_loss = localization.train_gat_model(
+                hidden_channels=hidden_channels,
+                heads=heads,
+                lr=lr,
+                weight_decay=weight_decay
+            )
+            val_avg_distance = best_val_avg_distance
+            # 用 rfid_test_tags.csv 的数据评估验证集（即新标签数据）
+            test_avg_distance = localization.evaluate_prediction_GAT_accuracy(
+                test_data=(test_features_np, test_labels_np),
+                num_samples=len(test_features_np)
+            )
 
-        # 直接调用 train_gat_model 进行训练和测试
-        best_val_avg_distance, best_val_loss = localization.train_gat_model(
-            hidden_channels=hidden_channels,
-            heads=heads,
-            lr=lr,
-            weight_decay=weight_decay
-        )
-        val_avg_distance = best_val_avg_distance
-        # 用 rfid_test_tags.csv 的数据评估验证集（即新标签数据）
-        test_avg_distance = localization.evaluate_prediction_GAT_accuracy(
-            test_data=(test_features_np, test_labels_np),
-            num_samples=len(test_features_np)
-        )
+            # 存储结果
+            result = {
+                'K': k,
+                'lr': lr,
+                'weight_decay': weight_decay,
+                'hidden_channels': hidden_channels,
+                'heads': heads,
+                'val_avg_distance': val_avg_distance,
+                'test_avg_distance': test_avg_distance
+            }
+            gat_results.append(result)
 
-        # 存储结果
-        result = {
-            'K': k,
-            'lr': lr,
-            'weight_decay': weight_decay,
-            'hidden_channels': hidden_channels,
-            'heads': heads,
-            'val_avg_distance': val_avg_distance,
-            'test_avg_distance': test_avg_distance
-        }
-        gat_results.append(result)
-
-        print(f"测试集平均误差: {val_avg_distance:.2f}米")
-        print(f"验证集平均误差: {test_avg_distance:.2f}米")
+            print(f"测试集平均误差: {val_avg_distance:.2f}米")
+            print(f"验证集平均误差: {test_avg_distance:.2f}米")
+        gat_results.sort(key=lambda x: x['test_avg_distance'])
+        print("GAT 最佳参数：", gat_results[0])
 
     # 执行异构图网格搜索
-    print(f"\n开始异构图网格搜索，共 {len(hetero_param_combinations)} 种组合")
+    if config['OPEN_HETERO']:
+        print(f"\n开始异构图网格搜索，共 {len(hetero_param_combinations)} 种组合")
+        for i, (k, lr, weight_decay, hidden_channels,
+                heads) in enumerate(hetero_param_combinations):
+            print(f"\n异构图组合 {i+1}/{len(hetero_param_combinations)}:")
+            print(
+                f"K={k}, lr={lr}, weight_decay={weight_decay}, hidden_channels={hidden_channels}, heads={heads}"
+            )
 
-    for i, (k, lr, weight_decay, hidden_channels,
-            heads) in enumerate(hetero_param_combinations):
-        print(f"\n异构图组合 {i+1}/{len(hetero_param_combinations)}:")
-        print(
-            f"K={k}, lr={lr}, weight_decay={weight_decay}, hidden_channels={hidden_channels}, heads={heads}"
-        )
+            # 更新配置
+            current_config = config.copy()
+            current_config['K'] = k
 
-        # 更新配置
-        current_config = config.copy()
-        current_config['K'] = k
+            # 初始化定位系统
+            localization = RFIDLocalization(current_config)
 
-        # 初始化定位系统
-        localization = RFIDLocalization(current_config)
+            # 使用最佳MLP模型替换新初始化的MLP模型
+            localization.mlp_model = best_mlp_model
 
-        # 使用最佳MLP模型替换新初始化的MLP模型
-        localization.mlp_model = best_mlp_model
+            # 确保标准化器与最佳MLP模型一致
+            localization.scaler_rssi = best_mlp_localization.scaler_rssi
+            localization.scaler_phase = best_mlp_localization.scaler_phase
+            localization.labels_scaler = best_mlp_localization.labels_scaler
 
-        # 确保标准化器与最佳MLP模型一致
-        localization.scaler_rssi = best_mlp_localization.scaler_rssi
-        localization.scaler_phase = best_mlp_localization.scaler_phase
-        localization.labels_scaler = best_mlp_localization.labels_scaler
+            # 直接调用 train_hetero_model 进行训练
+            best_val_avg_distance, best_val_loss = localization.train_hetero_model(
+                hidden_channels=hidden_channels,
+                heads=heads,
+                lr=lr,
+                weight_decay=weight_decay
+            )
+            val_avg_distance = best_val_avg_distance
 
-        # 直接调用 train_hetero_model 进行训练
-        best_val_avg_distance, best_val_loss = localization.train_hetero_model(
-            hidden_channels=hidden_channels,
-            heads=heads,
-            lr=lr,
-            weight_decay=weight_decay
-        )
-        val_avg_distance = best_val_avg_distance
+            # 用测试数据评估异构图模型
+            test_avg_distance = localization.evaluate_prediction_hetero_accuracy(
+                test_data=(test_features_np, test_labels_np),
+                num_samples=len(test_features_np)
+            )
 
-        # 用测试数据评估异构图模型
-        test_avg_distance = localization.evaluate_prediction_hetero_accuracy(
-            test_data=(test_features_np, test_labels_np),
-            num_samples=len(test_features_np)
-        )
+            # 存储结果
+            result = {
+                'K': k,
+                'lr': lr,
+                'weight_decay': weight_decay,
+                'hidden_channels': hidden_channels,
+                'heads': heads,
+                'val_avg_distance': val_avg_distance,
+                'test_avg_distance': test_avg_distance
+            }
+            hetero_results.append(result)
 
-        # 存储结果
-        result = {
-            'K': k,
-            'lr': lr,
-            'weight_decay': weight_decay,
-            'hidden_channels': hidden_channels,
-            'heads': heads,
-            'val_avg_distance': val_avg_distance,
-            'test_avg_distance': test_avg_distance
-        }
-        hetero_results.append(result)
-
-        print(f"测试集平均误差: {val_avg_distance:.2f}米")
-        print(f"验证集平均误差: {test_avg_distance:.2f}米")
+            print(f"测试集平均误差: {val_avg_distance:.2f}米")
+            print(f"验证集平均误差: {test_avg_distance:.2f}米")
 
     # 按验证集平均误差排序
-    gat_results.sort(key=lambda x: x['test_avg_distance'])
     mlp_results.sort(key=lambda x: x['test_avg_distance'])
     hetero_results.sort(key=lambda x: x['test_avg_distance'])
-
-    # 输出最佳GAT超参数
-    best_gat_result = gat_results[0]
-    print("\n============ 最佳GAT超参数 ============")
-    print(f"K: {best_gat_result['K']}")
-    print(f"学习率: {best_gat_result['lr']}")
-    print(f"权重衰减: {best_gat_result['weight_decay']}")
-    print(f"隐藏层通道数: {best_gat_result['hidden_channels']}")
-    print(f"注意力头数: {best_gat_result['heads']}")
-    print(f"验证集平均误差: {best_gat_result['test_avg_distance']:.2f}米")
+    if config['OPEN_GAT']:
+        # 输出最佳GAT超参数
+        best_gat_result = gat_results[0]
+        print("\n============ 最佳GAT超参数 ============")
+        print(f"K: {best_gat_result['K']}")
+        print(f"学习率: {best_gat_result['lr']}")
+        print(f"权重衰减: {best_gat_result['weight_decay']}")
+        print(f"隐藏层通道数: {best_gat_result['hidden_channels']}")
+        print(f"注意力头数: {best_gat_result['heads']}")
+        print(f"验证集平均误差: {best_gat_result['test_avg_distance']:.2f}米")
+        all_results.append(("GAT", best_gat_result['test_avg_distance']))
 
     # 输出最佳MLP超参数
     best_mlp_result = mlp_results[0]
@@ -307,16 +310,18 @@ def run_grid_search(
     print(f"隐藏层通道数: {best_mlp_result['hidden_channels']}")
     print(f"Dropout比率: {best_mlp_result['dropout']}")
     print(f"验证集平均误差: {best_mlp_result['test_avg_distance']:.2f}米")
-
-    # 输出最佳异构图超参数
-    best_hetero_result = hetero_results[0]
-    print("\n============ 最佳异构图超参数 ============")
-    print(f"K: {best_hetero_result['K']}")
-    print(f"学习率: {best_hetero_result['lr']}")
-    print(f"权重衰减: {best_hetero_result['weight_decay']}")
-    print(f"隐藏层通道数: {best_hetero_result['hidden_channels']}")
-    print(f"注意力头数: {best_hetero_result['heads']}")
-    print(f"验证集平均误差: {best_hetero_result['test_avg_distance']:.2f}米")
+    all_results.append(("MLP", best_mlp_result['test_avg_distance']))
+    if config['OPEN_HETERO']:
+        # 输出最佳异构图超参数
+        best_hetero_result = hetero_results[0]
+        print("\n============ 最佳异构图超参数 ============")
+        print(f"K: {best_hetero_result['K']}")
+        print(f"学习率: {best_hetero_result['lr']}")
+        print(f"权重衰减: {best_hetero_result['weight_decay']}")
+        print(f"隐藏层通道数: {best_hetero_result['hidden_channels']}")
+        print(f"注意力头数: {best_hetero_result['heads']}")
+        print(f"验证集平均误差: {best_hetero_result['test_avg_distance']:.2f}米")
+        all_results.append(("异构图", best_hetero_result['test_avg_distance']))
 
     # 确保结果目录存在
     os.makedirs(config['RESULTS_DIR'], exist_ok=True)
@@ -345,10 +350,6 @@ def run_grid_search(
     total_time = end_time - start_time
     print(f"\n网格搜索总耗时: {total_time:.2f} 秒")
 
-    # 比较所有模型的最佳结果
-    all_results = [("GAT", best_gat_result['test_avg_distance']),
-                   ("MLP", best_mlp_result['test_avg_distance']),
-                   ("异构图", best_hetero_result['test_avg_distance'])]
     # 按照误差从小到大排序
     sorted_models = sorted(all_results, key=lambda x: x[1])
     best_model_name, best_error = sorted_models[0]
