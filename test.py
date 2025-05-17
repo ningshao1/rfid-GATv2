@@ -38,7 +38,6 @@ from models.gat.model import GATLocalizationModel
 from models.gat.utils import train_gat_model, evaluate_prediction_GAT_accuracy, create_data_masks, to_device
 # 导入utils的run_grid_search
 from models.utils.grid_search import run_grid_search
-
 # 忽略警告
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -129,29 +128,19 @@ class RFIDLocalization:
 
     def load_data(self):
         """加载和预处理数据"""
-        # 读取数据
-        self.df = pd.read_csv(self.config['REFERENCE_DATA_PATH'])
 
-        # 提取特征和标签
-        self.features = to_device(
-            torch.tensor(
-                self.df[[
-                    'rssi_antenna1', 'rssi_antenna2', 'rssi_antenna3', 'rssi_antenna4',
-                    "phase_antenna1", "phase_antenna2", "phase_antenna3",
-                    "phase_antenna4"
-                ]].values,
-                dtype=torch.float32
-            ), self.device
+        # 加载数据
+        features, labels, features_np, labels_np, _ = load_and_preprocess_test_data(
+            self.config['REFERENCE_DATA_PATH']
         )
-        self.labels = to_device(
-            torch.tensor(self.df[['true_x', 'true_y']].values, dtype=torch.float32),
-            self.device
-        )
+
+        # 转移到设备
+        self.features = to_device(features, self.device)
+        self.labels = to_device(labels, self.device)
 
         # 标准化特征
-        rssi_norm = self.scaler_rssi.fit_transform(self.features[:, :4].cpu().numpy())
-        phase = self.features[:, 4:8].cpu().numpy()
-        phase_norm = self.scaler_phase.fit_transform(phase)
+        rssi_norm = self.scaler_rssi.fit_transform(features_np[:, :4])
+        phase_norm = self.scaler_phase.fit_transform(features_np[:, 4:8])
         self.features_norm = to_device(
             torch.tensor(np.hstack([rssi_norm, phase_norm]), dtype=torch.float32),
             self.device
@@ -419,42 +408,40 @@ class RFIDLocalization:
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
 
-        if test_data is None:
-            raise ValueError("必须提供 test_data 参数，不能为 None")
-        else:
-            test_features, test_labels = test_data
+        # 准备测试数据
+        if test_data is not None:
+            test_features_np, test_labels_np = test_data
+            # 将测试数据转换为张量
             test_features = to_device(
-                torch.tensor(test_features, dtype=torch.float32), self.device
+                torch.tensor(test_features_np, dtype=torch.float32), self.device
             )
             test_labels = to_device(
-                torch.tensor(test_labels, dtype=torch.float32), self.device
+                torch.tensor(test_labels_np, dtype=torch.float32), self.device
             )
+            # 标准化特征
+            rssi_norm = self.scaler_rssi.transform(test_features[:, :4].cpu().numpy())
+            phase_norm = self.scaler_phase.transform(
+                test_features[:, 4:8].cpu().numpy()
+            )
+            features_norm = to_device(
+                torch.tensor(np.hstack([rssi_norm, phase_norm]), dtype=torch.float32),
+                self.device
+            )
+        else:
+            # 随机抽样
+            indices = np.random.choice(
+                len(self.features_norm),
+                size=min(num_samples, len(self.features_norm)),
+                replace=False
+            )
+            features_norm = self.features_norm[indices]
+            test_labels = self.labels[indices]
 
-        # 标准化测试特征
-        rssi_values = test_features[:, :4]
-        phase_values = test_features[:, 4:8]
-        rssi_norm = self.scaler_rssi.transform(rssi_values.cpu().numpy())
-        phase_norm = self.scaler_phase.transform(phase_values.cpu().numpy())
-        features_norm = np.hstack([rssi_norm, phase_norm])
-        features_norm = to_device(
-            torch.tensor(features_norm, dtype=torch.float32), self.device
-        )
+        # 准备天线位置
+        antenna_positions = self.antenna_locations.clone()
 
-        # 预测结果列表
+        # 存储预测结果
         predicted_positions = []
-
-        # 确保MLP模型已训练，用于初始估计
-        if self.mlp_model is None:
-            print("mlp_model为空，开始训练MLP模型进行初始估计")
-            self.train_mlp_model()
-
-        # 标准化天线位置
-        antenna_locations_norm = to_device(
-            torch.tensor(
-                self.labels_scaler.transform(self.antenna_locations.cpu().numpy()),
-                dtype=torch.float32
-            ), self.device
-        )
 
         # 单独预测每个测试样本
         for i in range(len(features_norm)):
@@ -483,7 +470,7 @@ class RFIDLocalization:
             full_hetero_data = create_heterogeneous_graph_data(
                 self.features_norm,
                 self.labels_norm,
-                antenna_locations_norm,
+                antenna_positions,
                 k=self.config['K'],
                 device=self.device,
                 chair_info=chair_info,

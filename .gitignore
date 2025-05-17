@@ -1,6 +1,6 @@
+results/
 .venv/*
 .get_min
 __pycache__/
 */.DS_Store
 log/
-results/

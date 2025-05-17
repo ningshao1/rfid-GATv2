@@ -10,7 +10,7 @@ CONFIG = {
     'OPEN_KNN': True,  # 启用KNN算法进行比较
     'TRAIN_LOG': False,  # 启用训练日志
     'PREDICTION_LOG': False,  # 启用预测日志
-    'GRID_SEARCH': True,  # 是否启用网格搜索
+    'GRID_SEARCH': False,  # 是否启用网格搜索
     'QUICK_SEARCH': False,  # 是否使用快速搜索（减少组合数量）
     'OPEN_MLP': True,  # 启用MLP算法进行比较
     'OPEN_GAT': True,  # 启用GAT算法进行比较
@@ -35,22 +35,22 @@ CONFIG = {
         'GAT': {
             'K': 7,
             'lr': 0.001,
-            'weight_decay': 0.0001,
-            'hidden_channels': 128,
+            'weight_decay': 1e-05,
+            'hidden_channels': 32,
             'heads': 1
         },
         'MLP': {
             'lr': 0.005,
-            'weight_decay': 0.0001,
-            'hidden_channels': 128,
+            'weight_decay': 5e-05,
+            'hidden_channels': 64,
             'dropout': 0.1
         },
         '异构图': {
-            'K': 7,
-            'lr': 0.005,
-            'weight_decay': 0.0005,
-            'hidden_channels': 64,
-            'heads': 1
+            'K': 8,
+            'lr': 0.001,
+            'weight_decay': 5e-05,
+            'hidden_channels': 128,
+            'heads': 2
         }
     },
 
@@ -74,8 +74,8 @@ CONFIG = {
 
     # 边属性权重配置
     'EDGE_ATTR_WEIGHTS': {
-        'w1': 0.7,  # 距离影响权重增加
-        'w2': 0.2,  # RSSI影响权重增加
-        'w3': 0.1,  # 材质和大小影响权重降低，减少椅子材质的影响
+        'w1': 0.6,  # 距离影响权重增加
+        'w2': 0.4,  # RSSI影响权重增加
+        'w3': 0.3,  # 材质和大小影响权重降低，减少椅子材质的影响
     }
 }

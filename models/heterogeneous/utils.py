@@ -87,6 +87,420 @@ def check_obstruction(antenna_pos, tag_pos, chair_pos, chair_size):
     return is_obstructing, line_distance
 
 
+# 批量检查遮挡关系
+def batch_check_obstruction(
+    antenna_positions, tag_positions, chair_positions, chair_sizes
+):
+    """
+    批量检测椅子是否位于天线和标签之间，形成遮挡
+
+    参数:
+        antenna_positions: 所有天线位置坐标 [num_antennas, 2]
+        tag_positions: 所有标签位置坐标 [num_tags, 2]
+        chair_positions: 所有椅子位置坐标 [num_chairs, 2]
+        chair_sizes: 所有椅子大小 [num_chairs]
+
+    返回:
+        obstruction_matrix: 形状为 [num_chairs, num_tags, num_antennas] 的布尔矩阵，
+                           表示每个(椅子,标签,天线)组合是否存在遮挡
+        distance_matrix: 形状为 [num_chairs, num_tags, num_antennas] 的距离矩阵
+    """
+    # 转换为numpy数组
+    if isinstance(antenna_positions, torch.Tensor):
+        antenna_positions = antenna_positions.cpu().numpy()
+    if isinstance(tag_positions, torch.Tensor):
+        tag_positions = tag_positions.cpu().numpy()
+    if isinstance(chair_positions, torch.Tensor):
+        chair_positions = chair_positions.cpu().numpy()
+    if isinstance(chair_sizes, torch.Tensor):
+        chair_sizes = chair_sizes.cpu().numpy()
+
+    num_antennas = len(antenna_positions)
+    num_tags = len(tag_positions)
+    num_chairs = len(chair_positions)
+
+    # 初始化结果矩阵
+    obstruction_matrix = np.zeros((num_chairs, num_tags, num_antennas), dtype=bool)
+    distance_matrix = np.zeros((num_chairs, num_tags, num_antennas))
+
+    # 计算所有组合的遮挡关系
+    for chair_idx in range(num_chairs):
+        chair_pos = chair_positions[chair_idx]
+        chair_size = chair_sizes[chair_idx]
+
+        for tag_idx in range(num_tags):
+            tag_pos = tag_positions[tag_idx]
+
+            for antenna_idx in range(num_antennas):
+                antenna_pos = antenna_positions[antenna_idx]
+
+                is_obstructing, line_distance = check_obstruction(
+                    antenna_pos, tag_pos, chair_pos, chair_size
+                )
+
+                obstruction_matrix[chair_idx, tag_idx, antenna_idx] = is_obstructing
+                distance_matrix[chair_idx, tag_idx, antenna_idx] = line_distance
+
+    return obstruction_matrix, distance_matrix
+
+
+def create_hetero_graph_edges(
+    data,
+    tag_features,
+    tag_positions,
+    antenna_positions,
+    chair_info=None,
+    k=7,
+    device='cpu',
+    edge_attr_weights=None
+):
+    """
+    为异构图创建各种类型的边
+
+    参数:
+        data: HeteroData对象
+        tag_features: 标签节点特征
+        tag_positions: 标签节点位置
+        antenna_positions: 天线节点位置
+        chair_info: 椅子信息，包含椅子特征和位置（可选）
+        k: KNN的K值
+        device: 计算设备
+        edge_attr_weights: 边属性计算的权重参数字典
+
+    返回:
+        更新后的HeteroData对象
+    """
+
+    # 获取节点数量
+    num_tags = len(tag_features)
+    num_antennas = len(antenna_positions)
+
+    # 使用特征和位置的组合来计算KNN
+    combined_features = torch.cat(
+        [
+            0.2 * tag_features,  # 给特征较小的权重
+            0.8 * tag_positions  # 给位置较大的权重
+        ],
+        dim=1
+    ).cpu().numpy()
+
+    # 计算KNN邻接矩阵
+    adj_matrix = kneighbors_graph(
+        combined_features,
+        n_neighbors=min(k, num_tags - 1) if num_tags > 1 else 1,
+        mode='distance',
+    )
+
+    # 提取边索引和边属性
+    adj_matrix_coo = adj_matrix.tocoo()
+    edge_index = torch.tensor(
+        np.vstack([adj_matrix_coo.row, adj_matrix_coo.col]), dtype=torch.long
+    ).to(device)
+    edge_attr = torch.tensor(adj_matrix_coo.data,
+                             dtype=torch.float32).view(-1, 1).to(device)
+
+    # 设置标签-标签边
+    data['tag', 'to', 'tag'].edge_index = edge_index
+    data['tag', 'to', 'tag'].edge_attr = edge_attr
+
+    # 使用矩阵操作批量计算距离
+    tag_positions_expanded = tag_positions.unsqueeze(1)  # [num_tags, 1, 2]
+    antenna_positions_expanded = antenna_positions.unsqueeze(0)  # [1, num_antennas, 2]
+
+    # 计算欧氏距离矩阵 [num_tags, num_antennas]
+    distances = torch.sqrt(
+        torch.sum((tag_positions_expanded - antenna_positions_expanded)**2, dim=2)
+    )
+
+    # 预先计算标签节点特征范数
+    tag_features_norm = torch.norm(tag_features, dim=1).unsqueeze(1)  # [num_tags, 1]
+
+    # 特征距离
+    feat_weight = 0.2  # 特征权重
+    dist_matrix = (1 - feat_weight) * distances + feat_weight * tag_features_norm
+
+    # 创建边索引和属性
+    tag_to_antenna_edges = []
+    antenna_to_tag_edges = []
+    tag_to_antenna_attrs = []
+    antenna_to_tag_attrs = []
+
+    for tag_idx in range(num_tags):
+        for antenna_idx in range(num_antennas):
+            # 添加双向边
+            tag_to_antenna_edges.append([tag_idx, antenna_idx])
+            antenna_to_tag_edges.append([antenna_idx, tag_idx])
+
+            # 边属性（距离）
+            dist = dist_matrix[tag_idx, antenna_idx].item()
+            tag_to_antenna_attrs.append(dist)
+            antenna_to_tag_attrs.append(dist)
+
+    # 转换为张量并设置边
+    if tag_to_antenna_edges:
+        tag_to_antenna_edge_index = torch.tensor(
+            tag_to_antenna_edges, dtype=torch.long
+        ).t().to(device)
+        antenna_to_tag_edge_index = torch.tensor(
+            antenna_to_tag_edges, dtype=torch.long
+        ).t().to(device)
+
+        tag_to_antenna_edge_attr = torch.tensor(
+            tag_to_antenna_attrs, dtype=torch.float32
+        ).view(-1, 1).to(device)
+        antenna_to_tag_edge_attr = torch.tensor(
+            antenna_to_tag_attrs, dtype=torch.float32
+        ).view(-1, 1).to(device)
+
+        data['tag', 'to', 'antenna'].edge_index = tag_to_antenna_edge_index
+        data['tag', 'to', 'antenna'].edge_attr = tag_to_antenna_edge_attr
+
+        data['antenna', 'to', 'tag'].edge_index = antenna_to_tag_edge_index
+        data['antenna', 'to', 'tag'].edge_attr = antenna_to_tag_edge_attr
+
+    # 3. 如果存在椅子节点，创建椅子相关的边
+    if chair_info is not None and hasattr(data,
+                                          'chair') and hasattr(data['chair'], 'x'):
+
+        # 获取椅子节点
+        chair_features = data['chair'].x
+        chair_positions = data['chair'].y
+
+        num_chairs = len(chair_positions)
+
+        # 提取椅子大小和材质系数
+        chair_sizes = chair_features[:, 0]  # 第一列是椅子大小
+        material_coefs = chair_features[:, 1]  # 第二列是材质系数
+
+        # 批量计算tag到chair的距离矩阵 [num_tags, num_chairs]
+        tag_positions_expanded = tag_positions.unsqueeze(1)  # [num_tags, 1, 2]
+        chair_positions_expanded = chair_positions.unsqueeze(0)  # [1, num_chairs, 2]
+        tag_chair_distances = torch.sqrt(
+            torch.sum((tag_positions_expanded - chair_positions_expanded)**2, dim=2)
+        )
+
+        # 预先计算tag的RSSI均值 [num_tags]
+        # 假设tag_features前4个维度是RSSI
+        if tag_features.shape[1] >= 4:
+            rssi_features = tag_features[:, :4]
+            tag_rssi_mean = torch.mean(rssi_features,
+                                       dim=1).unsqueeze(1)  # [num_tags, 1]
+        else:
+            # 如果没有足够的维度，使用标准化后的特征代替
+            tag_rssi_mean = torch.norm(tag_features,
+                                       dim=1).unsqueeze(1)  # [num_tags, 1]
+
+        # 批量计算遮挡关系
+        obstruction_matrix, distance_matrix = batch_check_obstruction(
+            antenna_positions.cpu().numpy(),
+            tag_positions.cpu().numpy(),
+            chair_positions.cpu().numpy(),
+            chair_sizes.cpu().numpy()
+        )
+
+        # 创建边容器
+        tag_to_chair_edges = []
+        chair_to_tag_edges = []
+        tag_to_chair_attrs = []
+        chair_to_tag_attrs = []
+
+        # 设置权重参数
+        if edge_attr_weights is None:
+            edge_attr_weights = {'w1': 0.6, 'w2': 0.1, 'w3': 0.3}
+        w1 = edge_attr_weights.get('w1', 0.6)  # 距离影响权重
+        w2 = edge_attr_weights.get('w2', 0.1)  # RSSI影响权重
+        w3 = edge_attr_weights.get('w3', 0.3)  # 材质和大小影响权重
+
+        # 计算边属性
+        for chair_idx in range(num_chairs):
+            chair_size = chair_sizes[chair_idx].item()
+            material_coef = material_coefs[chair_idx].item()
+
+            # 对每个可能的标签创建边
+            for tag_idx in range(num_tags):
+                distance = tag_chair_distances[tag_idx, chair_idx].item()
+                rssi_mean = tag_rssi_mean[tag_idx].item()
+
+                # 使用距离计算物理效应
+                # 距离越远，影响越小
+                distance_factor = 1.0 / (1.0 + distance)
+
+                # 物理效应计算
+                # 椅子尺寸对信号的衰减和多径
+                decay_factor = chair_size * 0.5 if chair_size > 0.5 else 0.1
+                # 多径效应，取决于椅子大小和材质
+                multipath_factor = (chair_size * material_coef) * 0.3
+                # 反射效应，主要取决于材质
+                reflection_factor = material_coef * 0.4 if material_coef > 3 else 0.0
+
+                # 遮挡因子
+                obstruction_factor = 0.0
+                for antenna_idx in range(num_antennas):
+                    if obstruction_matrix[chair_idx, tag_idx, antenna_idx]:
+                        # 粗略估计遮挡强度
+                        obstruction_factor += material_coef * 0.5
+                        break
+
+                # 组合所有项
+                physics_effect = (
+                    w1 * distance_factor + w2 * rssi_mean + w3 * (
+                        decay_factor + multipath_factor + reflection_factor +
+                        1.5 * obstruction_factor
+                    )
+                )
+
+                # 添加双向边
+                tag_to_chair_edges.append([tag_idx, chair_idx])
+                chair_to_tag_edges.append([chair_idx, tag_idx])
+
+                # 边属性
+                tag_to_chair_attrs.append(physics_effect)
+                chair_to_tag_attrs.append(physics_effect)
+
+        # 转换为张量并设置边
+        if tag_to_chair_edges:
+            tag_to_chair_edge_index = torch.tensor(
+                tag_to_chair_edges, dtype=torch.long
+            ).t().to(device)
+            chair_to_tag_edge_index = torch.tensor(
+                chair_to_tag_edges, dtype=torch.long
+            ).t().to(device)
+
+            tag_to_chair_edge_attr = torch.tensor(
+                tag_to_chair_attrs, dtype=torch.float32
+            ).view(-1, 1).to(device)
+            chair_to_tag_edge_attr = torch.tensor(
+                chair_to_tag_attrs, dtype=torch.float32
+            ).view(-1, 1).to(device)
+
+            data['tag', 'to', 'chair'].edge_index = tag_to_chair_edge_index
+            data['tag', 'to', 'chair'].edge_attr = tag_to_chair_edge_attr
+
+            data['chair', 'to', 'tag'].edge_index = chair_to_tag_edge_index
+            data['chair', 'to', 'tag'].edge_attr = chair_to_tag_edge_attr
+
+        # 预先计算所有椅子到所有天线的距离矩阵
+        chair_positions_expanded = chair_positions.unsqueeze(1)  # [num_chairs, 1, 2]
+        antenna_positions_expanded = antenna_positions.unsqueeze(
+            0
+        )  # [1, num_antennas, 2]
+
+        # 计算欧氏距离矩阵 [num_chairs, num_antennas]
+        chair_antenna_distances = torch.sqrt(
+            torch.sum((chair_positions_expanded - antenna_positions_expanded)**2, dim=2)
+        )
+
+        # 创建边容器
+        chair_to_antenna_edges = []
+        antenna_to_chair_edges = []
+        chair_to_antenna_attrs = []
+        antenna_to_chair_attrs = []
+
+        # 遍历所有可能的椅子和天线对
+        for chair_idx in range(num_chairs):
+            chair_size = chair_sizes[chair_idx].item()
+            material_coef = material_coefs[chair_idx].item()
+
+            for antenna_idx in range(num_antennas):
+                distance = chair_antenna_distances[chair_idx, antenna_idx].item()
+
+                # 使用距离计算物理效应
+                # 距离越远，影响越小
+                distance_factor = 1.0 / (1.0 + distance)
+
+                # 信号衰减，与椅子尺寸和材质有关
+                decay_factor = chair_size * 0.5 * material_coef
+
+                # 反射效应，主要取决于材质
+                reflection_factor = material_coef * 0.4 if material_coef > 1.5 else 0.1
+
+                # 组合所有项
+                physics_effect = w1 * distance_factor + w3 * (
+                    decay_factor + reflection_factor
+                )
+
+                # 添加双向边
+                chair_to_antenna_edges.append([chair_idx, antenna_idx])
+                antenna_to_chair_edges.append([antenna_idx, chair_idx])
+
+                # 边属性
+                chair_to_antenna_attrs.append(physics_effect)
+                antenna_to_chair_attrs.append(physics_effect)
+
+        # 转换为张量并设置边
+        if chair_to_antenna_edges:
+            chair_to_antenna_edge_index = torch.tensor(
+                chair_to_antenna_edges, dtype=torch.long
+            ).t().to(device)
+            antenna_to_chair_edge_index = torch.tensor(
+                antenna_to_chair_edges, dtype=torch.long
+            ).t().to(device)
+
+            chair_to_antenna_edge_attr = torch.tensor(
+                chair_to_antenna_attrs, dtype=torch.float32
+            ).view(-1, 1).to(device)
+            antenna_to_chair_edge_attr = torch.tensor(
+                antenna_to_chair_attrs, dtype=torch.float32
+            ).view(-1, 1).to(device)
+
+            data['chair', 'to', 'antenna'].edge_index = chair_to_antenna_edge_index
+            data['chair', 'to', 'antenna'].edge_attr = chair_to_antenna_edge_attr
+
+            data['antenna', 'to', 'chair'].edge_index = antenna_to_chair_edge_index
+            data['antenna', 'to', 'chair'].edge_attr = antenna_to_chair_edge_attr
+
+        chair_obstructs_tag_edges = []
+        chair_obstructs_tag_attrs = []
+
+        # 直接使用计算得到的遮挡矩阵创建边
+        for chair_idx in range(num_chairs):
+            chair_size = chair_sizes[chair_idx].item()
+            material_coef = material_coefs[chair_idx].item()
+
+            for tag_idx in range(num_tags):
+                if np.any(obstruction_matrix[chair_idx, tag_idx]):
+                    # 找到遮挡的天线
+                    for antenna_idx in range(num_antennas):
+                        if obstruction_matrix[chair_idx, tag_idx, antenna_idx]:
+                            blockage_strength = material_coef * 0.5
+
+                            chair_obstructs_tag_edges.append([chair_idx, tag_idx])
+                            chair_obstructs_tag_attrs.append(blockage_strength)
+                            break
+
+        # 设置遮挡关系边
+        if chair_obstructs_tag_edges:
+            # 转换为张量
+            chair_obstructs_tag_edge_index = torch.tensor(
+                chair_obstructs_tag_edges, dtype=torch.long
+            ).t().to(device)
+            chair_obstructs_tag_edge_attr = torch.tensor(
+                chair_obstructs_tag_attrs, dtype=torch.float32
+            ).view(-1, 1).to(device)
+
+            # 添加到异构图
+            data['chair', 'obstructs',
+                 'tag'].edge_index = chair_obstructs_tag_edge_index
+            data['chair', 'obstructs', 'tag'].edge_attr = chair_obstructs_tag_edge_attr
+
+        # 3.4 为每个标签添加遮挡计数作为特征
+        obstruction_counts = torch.zeros(num_tags, dtype=torch.float32, device=device)
+        for tag_idx in range(num_tags):
+            # 统计每个标签被遮挡的情况
+            obstruction_count = 0
+            for chair_idx in range(num_chairs):
+                if np.any(obstruction_matrix[chair_idx, tag_idx]):
+                    obstruction_count += 1
+            obstruction_counts[tag_idx] = obstruction_count
+
+        # 添加到数据中
+        if hasattr(data, 'tag'):
+            data['tag'].obstruction_count = obstruction_counts.float().view(-1, 1
+                                                                           ).to(device)
+
+    return data
+
+
 def create_heterogeneous_graph_data(
     features_norm,
     labels_norm,
@@ -116,6 +530,7 @@ def create_heterogeneous_graph_data(
     返回:
         HeteroData对象
     """
+
     # 创建异构数据对象
     data = HeteroData()
 
@@ -143,95 +558,13 @@ def create_heterogeneous_graph_data(
     data['antenna'].x = antenna_features
     data['antenna'].y = antenna_positions
 
-    # 创建标签-标签之间的边（基于KNN）
-    # 使用特征和位置的组合来计算KNN
-    combined_features = torch.cat(
-        [
-            0.2 * features_norm,  # 给特征较小的权重
-            0.8 * labels_norm  # 给位置较大的权重
-        ],
-        dim=1
-    ).cpu().numpy()
-
-    # 计算KNN邻接矩阵
-    adj_matrix = kneighbors_graph(
-        combined_features,
-        n_neighbors=k,
-        mode='distance',
-    )
-
-    # 提取边索引和边属性
-    adj_matrix_coo = adj_matrix.tocoo()
-    edge_index = torch.tensor(
-        np.vstack([adj_matrix_coo.row, adj_matrix_coo.col]), dtype=torch.long
-    ).to(device)
-    edge_attr = torch.tensor(adj_matrix_coo.data,
-                             dtype=torch.float32).view(-1, 1).to(device)
-
-    # 设置标签-标签边
-    data['tag', 'to', 'tag'].edge_index = edge_index
-    data['tag', 'to', 'tag'].edge_attr = edge_attr
-
-    # 创建标签-天线和天线-标签之间的边
-    tag_to_antenna_edges = []
-    antenna_to_tag_edges = []
-    tag_to_antenna_attrs = []
-    antenna_to_tag_attrs = []
-
-    # 为每个标签节点添加到各个天线的边
-    for tag_idx in range(num_tags):
-        for antenna_idx in range(num_antennas):
-            # 计算标签节点到天线的欧氏距离
-            pos_dist = torch.sqrt(
-                torch.sum((labels_norm[tag_idx] - antenna_positions[antenna_idx])**2)
-            )
-
-            # 特征距离
-            feat_weight = 0.2  # 特征权重
-            dist = (1 - feat_weight) * pos_dist + feat_weight * \
-                torch.norm(features_norm[tag_idx])
-
-            # 添加双向边
-            tag_to_antenna_edges.append([tag_idx, antenna_idx])
-            antenna_to_tag_edges.append([antenna_idx, tag_idx])
-
-            # 边属性（距离）
-            tag_to_antenna_attrs.append(dist.item())
-            antenna_to_tag_attrs.append(dist.item())
-
-    # 转换为张量并设置边
-    if tag_to_antenna_edges:
-        tag_to_antenna_edge_index = torch.tensor(
-            tag_to_antenna_edges, dtype=torch.long
-        ).t().to(device)
-        antenna_to_tag_edge_index = torch.tensor(
-            antenna_to_tag_edges, dtype=torch.long
-        ).t().to(device)
-
-        tag_to_antenna_edge_attr = torch.tensor(
-            tag_to_antenna_attrs, dtype=torch.float32
-        ).view(-1, 1).to(device)
-        antenna_to_tag_edge_attr = torch.tensor(
-            antenna_to_tag_attrs, dtype=torch.float32
-        ).view(-1, 1).to(device)
-
-        data['tag', 'to', 'antenna'].edge_index = tag_to_antenna_edge_index
-        data['tag', 'to', 'antenna'].edge_attr = tag_to_antenna_edge_attr
-
-        data['antenna', 'to', 'tag'].edge_index = antenna_to_tag_edge_index
-        data['antenna', 'to', 'tag'].edge_attr = antenna_to_tag_edge_attr
-
     # 添加椅子节点（如果提供了椅子信息）
-    if chair_info is not None:
+    if chair_info is not None and len(chair_info) > 0:
         # 确保chair_info是列表类型
         if not isinstance(chair_info, list):
             chair_info = [chair_info]
 
         num_chairs = len(chair_info)
-
-        # 如果没有椅子信息，直接返回
-        if num_chairs == 0:
-            return data
 
         # 椅子特征向量的维度与标签特征维度相同
         chair_feature_dim = features_norm.shape[1]
@@ -279,287 +612,12 @@ def create_heterogeneous_graph_data(
             data['chair'].x = chair_features
             data['chair'].y = chair_positions_tensor
 
-            # 创建标签-椅子和椅子-标签之间的边
-            tag_to_chair_edges = []
-            chair_to_tag_edges = []
-            tag_to_chair_attrs = []
-            chair_to_tag_attrs = []
-
-            # 为每个标签节点添加到每个椅子的边，仅当存在遮挡关系时
-            for tag_idx in range(num_tags):
-                for chair_idx in range(num_chairs):
-                    # 检查是否存在遮挡关系
-                    has_obstruction = False
-                    obstruction_factor = 0.0
-                    chair_size = chair_features[chair_idx, 0].item()
-                    material_coef = chair_features[chair_idx, 1].item()
-
-                    # 检查是否有天线到标签的信号被椅子遮挡
-                    for antenna_idx in range(num_antennas):
-                        antenna_pos = antenna_positions[antenna_idx]
-                        # 使用遮挡检测函数
-                        is_obstructing, line_distance = check_obstruction(
-                            antenna_pos, labels_norm[tag_idx],
-                            chair_positions_tensor[chair_idx], chair_size
-                        )
-                        if is_obstructing:
-                            has_obstruction = True
-                            # 遮挡强度计算
-                            blockage_strength = material_coef * (
-                                1.0 - line_distance / (chair_size * 2.0)
-                            )
-                            obstruction_factor += blockage_strength
-
-                    # 只有当存在遮挡关系时才建立边
-                    if has_obstruction:
-                        # 计算标签节点到椅子的欧氏距离
-                        pos_dist = torch.sqrt(
-                            torch.sum((
-                                labels_norm[tag_idx] - chair_positions_tensor[chair_idx]
-                            )**2)
-                        )
-
-                        # 参数设置
-                        w1 = edge_attr_weights['w1']  # 距离影响权重
-                        w2 = edge_attr_weights['w2']  # RSSI影响权重
-                        w3 = edge_attr_weights['w3']  # 材质和大小影响权重
-
-                        # 1. 距离项: 1/(1+d)
-                        distance_factor = 1.0 / (1.0 + pos_dist.item())
-
-                        # 2. RSSI均值项
-                        # 假设RSSI值存储在features的前4个维度
-                        if features_norm.shape[1] >= 4:
-                            rssi_values = features_norm[tag_idx, :4]
-                            rssi_mean = torch.mean(rssi_values).item()
-                        else:
-                            # 如果没有足够的RSSI值，使用特征的平均值
-                            rssi_mean = torch.mean(features_norm[tag_idx]).item()
-
-                        # 3. 材质与大小的衰减项
-                        # L_chair代表材质系数，size代表椅子大小
-                        L_chair = material_coef
-                        if pos_dist.item() > 0:
-                            decay_factor = L_chair * torch.exp(
-                                torch.tensor(-chair_size / (2 * pos_dist.item()))
-                            ).item()
-                        else:
-                            # 避免除以零
-                            decay_factor = L_chair * torch.exp(
-                                torch.tensor(-chair_size / 0.01)
-                            ).item()
-
-                        # 4. 多径效应影响
-                        multipath_factor = 0.0
-                        if pos_dist.item() > 0:
-                            multipath_factor = 0.2 * L_chair * np.sin(
-                                pos_dist.item() * 5
-                            )
-
-                        # 5. 反射与散射效应（特别是金属材质）
-                        reflection_factor = 0.0
-                        if L_chair > 3:  # 金属材质
-                            reflection_factor = 0.3 * np.exp(-pos_dist.item() / 3)
-
-                        # 组合所有项
-                        physics_effect = (
-                            w1 * distance_factor + w2 * rssi_mean + w3 * (
-                                decay_factor + multipath_factor + reflection_factor +
-                                1.5 * obstruction_factor
-                            )
-                        )
-
-                        # 添加双向边
-                        tag_to_chair_edges.append([tag_idx, chair_idx])
-                        chair_to_tag_edges.append([chair_idx, tag_idx])
-
-                        # 边属性（物理效应）
-                        tag_to_chair_attrs.append(physics_effect)
-                        chair_to_tag_attrs.append(physics_effect)
-
-            # 转换为张量并设置边
-            if tag_to_chair_edges:
-                tag_to_chair_edge_index = torch.tensor(
-                    tag_to_chair_edges, dtype=torch.long
-                ).t().to(device)
-                chair_to_tag_edge_index = torch.tensor(
-                    chair_to_tag_edges, dtype=torch.long
-                ).t().to(device)
-
-                tag_to_chair_edge_attr = torch.tensor(
-                    tag_to_chair_attrs, dtype=torch.float32
-                ).view(-1, 1).to(device)
-                chair_to_tag_edge_attr = torch.tensor(
-                    chair_to_tag_attrs, dtype=torch.float32
-                ).view(-1, 1).to(device)
-
-                data['tag', 'to', 'chair'].edge_index = tag_to_chair_edge_index
-                data['tag', 'to', 'chair'].edge_attr = tag_to_chair_edge_attr
-
-                data['chair', 'to', 'tag'].edge_index = chair_to_tag_edge_index
-                data['chair', 'to', 'tag'].edge_attr = chair_to_tag_edge_attr
-
-            # 创建椅子-天线和天线-椅子之间的边
-            chair_to_antenna_edges = []
-            antenna_to_chair_edges = []
-            chair_to_antenna_attrs = []
-            antenna_to_chair_attrs = []
-
-            # 为每个椅子添加到各个天线的边
-            for chair_idx in range(num_chairs):
-                # 获取椅子信息
-                chair_size = chair_features[chair_idx, 0].item()
-                material_coef = chair_features[chair_idx, 1].item()
-
-                for antenna_idx in range(num_antennas):
-                    # 计算椅子到天线的欧氏距离
-                    pos_dist = torch.sqrt(
-                        torch.sum((
-                            chair_positions_tensor[chair_idx] -
-                            antenna_positions[antenna_idx]
-                        )**2)
-                    )
-
-                    # 应用新的物理公式：椅子对天线信号的影响
-                    dca = pos_dist.item()
-                    L_chair = material_coef
-
-                    # 基础边属性计算公式: chair-to-antenna = 20log10(dca) + Lchair ⋅ (dca/size)
-                    if dca > 0:
-                        base_attr = 20 * np.log10(dca) + L_chair * (dca / chair_size)
-                    else:
-                        # 避免log(0)错误，使用一个很小的值
-                        base_attr = 20 * np.log10(0.01) + L_chair * (0.01 / chair_size)
-
-                    # 添加多径效应影响
-                    multipath_factor = 0.2 * L_chair * np.sin(dca * 5)
-
-                    # 添加反射与散射效应（特别是金属材质）
-                    reflection_factor = 0
-                    if L_chair > 3:  # 金属材质
-                        reflection_factor = 0.3 * np.exp(-dca / 3)
-
-                    # 检查信号遮挡效应
-                    obstruction_factor = 0.0
-                    # 检查是否有天线到标签的信号被椅子遮挡
-                    for tag_idx in range(len(labels_norm)):
-                        tag_pos = labels_norm[tag_idx]
-                        # 使用遮挡检测函数
-                        is_obstructing, line_distance = check_obstruction(
-                            antenna_positions[antenna_idx], tag_pos,
-                            chair_positions_tensor[chair_idx], chair_size
-                        )
-                        if is_obstructing:
-                            # 遮挡强度计算
-                            blockage_strength = L_chair * (
-                                1.0 - line_distance / (chair_size * 2.0)
-                            )
-                            obstruction_factor += blockage_strength
-
-                    # 组合所有项
-                    physics_effect = (
-                        base_attr + multipath_factor + reflection_factor +
-                        1.5 * obstruction_factor
-                    )
-
-                    # 添加双向边
-                    chair_to_antenna_edges.append([chair_idx, antenna_idx])
-                    antenna_to_chair_edges.append([antenna_idx, chair_idx])
-
-                    # 边属性（物理效应）
-                    chair_to_antenna_attrs.append(physics_effect)
-                    antenna_to_chair_attrs.append(physics_effect)
-
-            # 转换为张量并设置边
-            if chair_to_antenna_edges:
-                chair_to_antenna_edge_index = torch.tensor(
-                    chair_to_antenna_edges, dtype=torch.long
-                ).t().to(device)
-                antenna_to_chair_edge_index = torch.tensor(
-                    antenna_to_chair_edges, dtype=torch.long
-                ).t().to(device)
-
-                chair_to_antenna_edge_attr = torch.tensor(
-                    chair_to_antenna_attrs, dtype=torch.float32
-                ).view(-1, 1).to(device)
-                antenna_to_chair_edge_attr = torch.tensor(
-                    antenna_to_chair_attrs, dtype=torch.float32
-                ).view(-1, 1).to(device)
-
-                data['chair', 'to', 'antenna'].edge_index = chair_to_antenna_edge_index
-                data['chair', 'to', 'antenna'].edge_attr = chair_to_antenna_edge_attr
-
-                data['antenna', 'to', 'chair'].edge_index = antenna_to_chair_edge_index
-                data['antenna', 'to', 'chair'].edge_attr = antenna_to_chair_edge_attr
-
-            # 创建遮挡关系边：检测椅子是否遮挡天线与标签之间的信号
-            chair_obstructs_tag_edges = []
-            chair_obstructs_tag_attrs = []
-            obstruction_counts = {}  # 记录每个标签被遮挡的次数
-
-            # 初始化遮挡计数
-            for tag_idx in range(len(labels_norm)):
-                obstruction_counts[tag_idx] = 0
-
-            # 检查每个(椅子, 标签, 天线)组合是否存在遮挡
-            for tag_idx in range(len(labels_norm)):
-                tag_pos = labels_norm[tag_idx]
-
-                for chair_idx in range(num_chairs):
-                    chair_pos = chair_positions_tensor[chair_idx]
-                    chair_size = chair_features[chair_idx, 0].item()
-                    material_coef = chair_features[chair_idx, 1].item()
-
-                    # 检查是否存在遮挡（任何天线到该标签的路径被遮挡）
-                    for antenna_idx in range(num_antennas):
-                        antenna_pos = antenna_positions[antenna_idx]
-
-                        # 使用遮挡检测函数
-                        is_obstructing, line_distance = check_obstruction(
-                            antenna_pos, tag_pos, chair_pos, chair_size
-                        )
-
-                        if is_obstructing:
-                            # 计算遮挡强度：基于材质、距离和椅子大小
-                            blockage_strength = material_coef * (
-                                1.0 - line_distance / (chair_size * 2.0)
-                            )
-
-                            # 添加遮挡边
-                            chair_obstructs_tag_edges.append([chair_idx, tag_idx])
-                            chair_obstructs_tag_attrs.append(blockage_strength)
-
-                            # 记录遮挡次数
-                            obstruction_counts[tag_idx] += 1
-
-                            # 找到一个遮挡就足够了，不需要继续检查其他天线
-                            break
-
-            # 设置遮挡关系边
-            if chair_obstructs_tag_edges:
-                # 转换为张量
-                chair_obstructs_tag_edge_index = torch.tensor(
-                    chair_obstructs_tag_edges, dtype=torch.long
-                ).t().to(device)
-                chair_obstructs_tag_edge_attr = torch.tensor(
-                    chair_obstructs_tag_attrs, dtype=torch.float32
-                ).view(-1, 1).to(device)
-
-                # 添加到异构图
-                data['chair', 'obstructs',
-                     'tag'].edge_index = chair_obstructs_tag_edge_index
-                data['chair', 'obstructs',
-                     'tag'].edge_attr = chair_obstructs_tag_edge_attr
-
-            # 为每个标签添加遮挡计数作为特征
-            obstruction_feature = torch.zeros(len(labels_norm), 1,
-                                              dtype=torch.float32).to(device)
-            for tag_idx, count in obstruction_counts.items():
-                obstruction_feature[tag_idx, 0] = count
-
-            # 添加遮挡特征到标签节点
-            if 'obstruction_count' not in data['tag']:
-                data['tag'].obstruction_count = obstruction_feature
+    # 创建异构图的边
+    data = create_hetero_graph_edges(
+        data, features_norm, labels_norm, antenna_positions,
+        chair_info if chair_info and len(chair_info) > 0 else None, k, device,
+        edge_attr_weights
+    )
 
     return data
 
@@ -599,16 +657,18 @@ def add_new_node_to_hetero_graph(
     antenna_positions = hetero_data['antenna'].y
 
     # 检查是否存在椅子节点
-    has_chair = False
+    chair_info = None
     try:
         # 尝试访问椅子节点特征
         chair_features = hetero_data['chair'].x
         chair_positions = hetero_data['chair'].y
-        num_chairs = len(chair_positions)
-        has_chair = True
+        # 设置椅子节点特征和位置
+        new_data['chair'].x = chair_features
+        new_data['chair'].y = chair_positions
+        chair_info = True
     except (KeyError, AttributeError):
         # 如果发生KeyError或AttributeError，说明没有椅子节点
-        has_chair = False
+        pass
 
     # 添加新节点
     num_original_tags = len(original_tag_features)
@@ -637,375 +697,15 @@ def add_new_node_to_hetero_graph(
     new_data['antenna'].x = antenna_features
     new_data['antenna'].y = antenna_positions
 
-    # 如果存在椅子节点，添加到新图
-    if has_chair:
-        new_data['chair'].x = chair_features
-        new_data['chair'].y = chair_positions
-
     # 添加tag_mask来标记新节点
     tag_mask = torch.zeros(len(all_tag_features), dtype=torch.bool, device=device)
     tag_mask[num_original_tags:] = True  # 将新添加的节点标记为True
     new_data['tag'].tag_mask = tag_mask
 
-    # 创建标签-标签之间的边（基于KNN）
-    # 使用特征和位置的组合来计算KNN
-    combined_features = torch.cat(
-        [
-            0.2 * all_tag_features,  # 给特征较小的权重
-            0.8 * all_tag_positions  # 给位置较大的权重
-        ],
-        dim=1
-    ).cpu().numpy()
-
-    # 计算KNN邻接矩阵
-    adj_matrix = kneighbors_graph(
-        combined_features,
-        n_neighbors=k,
-        mode='distance',
+    # 创建异构图的边
+    new_data = create_hetero_graph_edges(
+        new_data, all_tag_features, all_tag_positions, antenna_positions, chair_info, k,
+        device, edge_attr_weights
     )
-
-    # 提取边索引和边属性
-    adj_matrix_coo = adj_matrix.tocoo()
-    edge_index = torch.tensor(
-        np.vstack([adj_matrix_coo.row, adj_matrix_coo.col]), dtype=torch.long
-    ).to(device)
-    edge_attr = torch.tensor(adj_matrix_coo.data,
-                             dtype=torch.float32).view(-1, 1).to(device)
-
-    # 设置标签-标签边
-    new_data['tag', 'to', 'tag'].edge_index = edge_index
-    new_data['tag', 'to', 'tag'].edge_attr = edge_attr
-
-    # 创建标签-天线和天线-标签之间的边
-    num_antennas = len(antenna_positions)
-    tag_to_antenna_edges = []
-    antenna_to_tag_edges = []
-    tag_to_antenna_attrs = []
-    antenna_to_tag_attrs = []
-
-    # 为每个标签节点添加到各个天线的边
-    for tag_idx in range(len(all_tag_features)):
-        for antenna_idx in range(num_antennas):
-            # 计算标签节点到天线的欧氏距离
-            pos_dist = torch.sqrt(
-                torch.sum(
-                    (all_tag_positions[tag_idx] - antenna_positions[antenna_idx])**2
-                )
-            )
-
-            # 特征距离
-            feat_weight = 0.2  # 特征权重
-            dist = (1 - feat_weight) * pos_dist + feat_weight * \
-                torch.norm(all_tag_features[tag_idx])
-
-            # 添加双向边
-            tag_to_antenna_edges.append([tag_idx, antenna_idx])
-            antenna_to_tag_edges.append([antenna_idx, tag_idx])
-
-            # 边属性（距离）
-            tag_to_antenna_attrs.append(dist.item())
-            antenna_to_tag_attrs.append(dist.item())
-
-    # 转换为张量并设置边
-    if tag_to_antenna_edges:
-        tag_to_antenna_edge_index = torch.tensor(
-            tag_to_antenna_edges, dtype=torch.long
-        ).t().to(device)
-        antenna_to_tag_edge_index = torch.tensor(
-            antenna_to_tag_edges, dtype=torch.long
-        ).t().to(device)
-
-        tag_to_antenna_edge_attr = torch.tensor(
-            tag_to_antenna_attrs, dtype=torch.float32
-        ).view(-1, 1).to(device)
-        antenna_to_tag_edge_attr = torch.tensor(
-            antenna_to_tag_attrs, dtype=torch.float32
-        ).view(-1, 1).to(device)
-
-        new_data['tag', 'to', 'antenna'].edge_index = tag_to_antenna_edge_index
-        new_data['tag', 'to', 'antenna'].edge_attr = tag_to_antenna_edge_attr
-
-        new_data['antenna', 'to', 'tag'].edge_index = antenna_to_tag_edge_index
-        new_data['antenna', 'to', 'tag'].edge_attr = antenna_to_tag_edge_attr
-
-    # 如果存在椅子节点，创建标签-椅子和椅子-标签之间的边
-    if has_chair:
-        tag_to_chair_edges = []
-        chair_to_tag_edges = []
-        tag_to_chair_attrs = []
-        chair_to_tag_attrs = []
-
-        # 为每个标签节点添加到每个椅子的边，仅当存在遮挡关系时
-        for tag_idx in range(len(all_tag_features)):
-            for chair_idx in range(num_chairs):
-                # 检查是否存在遮挡关系
-                has_obstruction = False
-                obstruction_factor = 0.0
-                chair_size = chair_features[chair_idx, 0].item()
-                material_coef = chair_features[chair_idx, 1].item()
-
-                # 检查是否有天线到标签的信号被椅子遮挡
-                for antenna_idx in range(num_antennas):
-                    antenna_pos = antenna_positions[antenna_idx]
-                    # 使用遮挡检测函数
-                    is_obstructing, line_distance = check_obstruction(
-                        antenna_pos, all_tag_positions[tag_idx],
-                        chair_positions[chair_idx], chair_size
-                    )
-                    if is_obstructing:
-                        has_obstruction = True
-                        # 遮挡强度计算
-                        blockage_strength = material_coef * (
-                            1.0 - line_distance / (chair_size * 2.0)
-                        )
-                        obstruction_factor += blockage_strength
-
-                # 只有当存在遮挡关系时才建立边
-                if has_obstruction:
-                    # 计算标签节点到椅子的欧氏距离
-                    pos_dist = torch.sqrt(
-                        torch.sum(
-                            (all_tag_positions[tag_idx] - chair_positions[chair_idx])**2
-                        )
-                    )
-
-                    # 参数设置
-                    w1 = edge_attr_weights['w1']  # 距离影响权重
-                    w2 = edge_attr_weights['w2']  # RSSI影响权重
-                    w3 = edge_attr_weights['w3']  # 材质和大小影响权重
-
-                    # 1. 距离项: 1/(1+d)
-                    distance_factor = 1.0 / (1.0 + pos_dist.item())
-
-                    # 2. RSSI均值项
-                    # 假设RSSI值存储在features的前4个维度
-                    if all_tag_features.shape[1] >= 4:
-                        rssi_values = all_tag_features[tag_idx, :4]
-                        rssi_mean = torch.mean(rssi_values).item()
-                    else:
-                        # 如果没有足够的RSSI值，使用特征的平均值
-                        rssi_mean = torch.mean(all_tag_features[tag_idx]).item()
-
-                    # 3. 材质与大小的衰减项
-                    # L_chair代表材质系数，size代表椅子大小
-                    L_chair = material_coef
-                    if pos_dist.item() > 0:
-                        decay_factor = L_chair * torch.exp(
-                            torch.tensor(-chair_size / (2 * pos_dist.item()))
-                        ).item()
-                    else:
-                        # 避免除以零
-                        decay_factor = L_chair * torch.exp(
-                            torch.tensor(-chair_size / 0.01)
-                        ).item()
-
-                    # 4. 多径效应影响
-                    multipath_factor = 0.0
-                    if pos_dist.item() > 0:
-                        multipath_factor = 0.2 * L_chair * np.sin(pos_dist.item() * 5)
-
-                    # 5. 反射与散射效应（特别是金属材质）
-                    reflection_factor = 0.0
-                    if L_chair > 3:  # 金属材质
-                        reflection_factor = 0.3 * np.exp(-pos_dist.item() / 3)
-
-                    # 组合所有项
-                    physics_effect = (
-                        w1 * distance_factor + w2 * rssi_mean + w3 * (
-                            decay_factor + multipath_factor + reflection_factor +
-                            1.5 * obstruction_factor
-                        )
-                    )
-
-                    # 添加双向边
-                    tag_to_chair_edges.append([tag_idx, chair_idx])
-                    chair_to_tag_edges.append([chair_idx, tag_idx])
-
-                    # 边属性（物理效应）
-                    tag_to_chair_attrs.append(physics_effect)
-                    chair_to_tag_attrs.append(physics_effect)
-
-        # 转换为张量并设置边
-        if tag_to_chair_edges:
-            tag_to_chair_edge_index = torch.tensor(
-                tag_to_chair_edges, dtype=torch.long
-            ).t().to(device)
-            chair_to_tag_edge_index = torch.tensor(
-                chair_to_tag_edges, dtype=torch.long
-            ).t().to(device)
-
-            tag_to_chair_edge_attr = torch.tensor(
-                tag_to_chair_attrs, dtype=torch.float32
-            ).view(-1, 1).to(device)
-            chair_to_tag_edge_attr = torch.tensor(
-                chair_to_tag_attrs, dtype=torch.float32
-            ).view(-1, 1).to(device)
-
-            new_data['tag', 'to', 'chair'].edge_index = tag_to_chair_edge_index
-            new_data['tag', 'to', 'chair'].edge_attr = tag_to_chair_edge_attr
-
-            new_data['chair', 'to', 'tag'].edge_index = chair_to_tag_edge_index
-            new_data['chair', 'to', 'tag'].edge_attr = chair_to_tag_edge_attr
-
-        # 创建椅子-天线和天线-椅子之间的边
-        chair_to_antenna_edges = []
-        antenna_to_chair_edges = []
-        chair_to_antenna_attrs = []
-        antenna_to_chair_attrs = []
-
-        # 为每个椅子添加到各个天线的边
-        for chair_idx in range(num_chairs):
-            # 获取椅子信息
-            chair_size = chair_features[chair_idx, 0].item()
-            material_coef = chair_features[chair_idx, 1].item()
-
-            for antenna_idx in range(num_antennas):
-                # 计算椅子到天线的欧氏距离
-                pos_dist = torch.sqrt(
-                    torch.sum(
-                        (chair_positions[chair_idx] - antenna_positions[antenna_idx])**2
-                    )
-                )
-
-                # 应用新的物理公式：椅子对天线信号的影响
-                dca = pos_dist.item()
-                L_chair = material_coef
-
-                # 基础边属性计算公式: chair-to-antenna = 20log10(dca) + Lchair ⋅ (dca/size)
-                if dca > 0:
-                    base_attr = 20 * np.log10(dca) + L_chair * (dca / chair_size)
-                else:
-                    # 避免log(0)错误，使用一个很小的值
-                    base_attr = 20 * np.log10(0.01) + L_chair * (0.01 / chair_size)
-
-                # 添加多径效应影响
-                multipath_factor = 0.2 * L_chair * np.sin(dca * 5)
-
-                # 添加反射与散射效应（特别是金属材质）
-                reflection_factor = 0
-                if L_chair > 3:  # 金属材质
-                    reflection_factor = 0.3 * np.exp(-dca / 3)
-
-                # 检查信号遮挡效应
-                obstruction_factor = 0.0
-                # 检查是否有天线到标签的信号被椅子遮挡
-                for tag_idx in range(len(all_tag_features)):
-                    tag_pos = all_tag_positions[tag_idx]
-                    # 使用遮挡检测函数
-                    is_obstructing, line_distance = check_obstruction(
-                        antenna_positions[antenna_idx], tag_pos,
-                        chair_positions[chair_idx], chair_size
-                    )
-                    if is_obstructing:
-                        # 遮挡强度计算
-                        blockage_strength = L_chair * (
-                            1.0 - line_distance / (chair_size * 2.0)
-                        )
-                        obstruction_factor += blockage_strength
-
-                # 组合所有项
-                physics_effect = (
-                    base_attr + multipath_factor + reflection_factor +
-                    1.5 * obstruction_factor
-                )
-
-                # 添加双向边
-                chair_to_antenna_edges.append([chair_idx, antenna_idx])
-                antenna_to_chair_edges.append([antenna_idx, chair_idx])
-
-                # 边属性（物理效应）
-                chair_to_antenna_attrs.append(physics_effect)
-                antenna_to_chair_attrs.append(physics_effect)
-
-        # 转换为张量并设置边
-        if chair_to_antenna_edges:
-            chair_to_antenna_edge_index = torch.tensor(
-                chair_to_antenna_edges, dtype=torch.long
-            ).t().to(device)
-            antenna_to_chair_edge_index = torch.tensor(
-                antenna_to_chair_edges, dtype=torch.long
-            ).t().to(device)
-
-            chair_to_antenna_edge_attr = torch.tensor(
-                chair_to_antenna_attrs, dtype=torch.float32
-            ).view(-1, 1).to(device)
-            antenna_to_chair_edge_attr = torch.tensor(
-                antenna_to_chair_attrs, dtype=torch.float32
-            ).view(-1, 1).to(device)
-
-            new_data['chair', 'to', 'antenna'].edge_index = chair_to_antenna_edge_index
-            new_data['chair', 'to', 'antenna'].edge_attr = chair_to_antenna_edge_attr
-
-            new_data['antenna', 'to', 'chair'].edge_index = antenna_to_chair_edge_index
-            new_data['antenna', 'to', 'chair'].edge_attr = antenna_to_chair_edge_attr
-
-            # 创建遮挡关系边：检测椅子是否遮挡天线与标签之间的信号
-            chair_obstructs_tag_edges = []
-            chair_obstructs_tag_attrs = []
-            obstruction_counts = {}  # 记录每个标签被遮挡的次数
-
-            # 初始化遮挡计数
-            for tag_idx in range(len(all_tag_features)):
-                obstruction_counts[tag_idx] = 0
-
-            # 检查每个(椅子, 标签, 天线)组合是否存在遮挡
-            for tag_idx in range(len(all_tag_features)):
-                tag_pos = all_tag_positions[tag_idx]
-
-                for chair_idx in range(num_chairs):
-                    chair_pos = chair_positions[chair_idx]
-                    chair_size = chair_features[chair_idx, 0].item()
-                    material_coef = chair_features[chair_idx, 1].item()
-
-                    # 检查是否存在遮挡（任何天线到该标签的路径被遮挡）
-                    for antenna_idx in range(num_antennas):
-                        antenna_pos = antenna_positions[antenna_idx]
-
-                        # 使用遮挡检测函数
-                        is_obstructing, line_distance = check_obstruction(
-                            antenna_pos, tag_pos, chair_pos, chair_size
-                        )
-
-                        if is_obstructing:
-                            # 计算遮挡强度：基于材质、距离和椅子大小
-                            blockage_strength = material_coef * (
-                                1.0 - line_distance / (chair_size * 2.0)
-                            )
-
-                            # 添加遮挡边
-                            chair_obstructs_tag_edges.append([chair_idx, tag_idx])
-                            chair_obstructs_tag_attrs.append(blockage_strength)
-
-                            # 记录遮挡次数
-                            obstruction_counts[tag_idx] += 1
-
-                            # 找到一个遮挡就足够了，不需要继续检查其他天线
-                            break
-
-            # 设置遮挡关系边
-            if chair_obstructs_tag_edges:
-                # 转换为张量
-                chair_obstructs_tag_edge_index = torch.tensor(
-                    chair_obstructs_tag_edges, dtype=torch.long
-                ).t().to(device)
-                chair_obstructs_tag_edge_attr = torch.tensor(
-                    chair_obstructs_tag_attrs, dtype=torch.float32
-                ).view(-1, 1).to(device)
-
-                # 添加到异构图
-                new_data['chair', 'obstructs',
-                         'tag'].edge_index = chair_obstructs_tag_edge_index
-                new_data['chair', 'obstructs',
-                         'tag'].edge_attr = chair_obstructs_tag_edge_attr
-
-            # 为每个标签添加遮挡计数作为特征
-            obstruction_feature = torch.zeros(
-                len(all_tag_features), 1, dtype=torch.float32
-            ).to(device)
-            for tag_idx, count in obstruction_counts.items():
-                obstruction_feature[tag_idx, 0] = count
-
-            # 添加遮挡特征到标签节点
-            new_data['tag'].obstruction_count = obstruction_feature
 
     return new_data
