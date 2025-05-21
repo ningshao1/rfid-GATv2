@@ -28,7 +28,8 @@ def load_and_preprocess_test_data(test_csv_path, scaler_rssi=None, scaler_phase=
     test_features = torch.tensor(
         df_test[[
             'rssi_antenna1', 'rssi_antenna2', 'rssi_antenna3', 'rssi_antenna4',
-            "phase_antenna1", "phase_antenna2", "phase_antenna3", "phase_antenna4"
+            "wrapped_phase_antenna1", "wrapped_phase_antenna2",
+            "wrapped_phase_antenna3", "wrapped_phase_antenna4"
         ]].values,
         dtype=torch.float32
     )

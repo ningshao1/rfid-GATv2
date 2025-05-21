@@ -13,7 +13,7 @@ CONFIG = {
     'GRID_SEARCH': True,  # 是否启用网格搜索
     'QUICK_SEARCH': False,  # 是否使用快速搜索（减少组合数量）
     'OPEN_MLP': True,  # 启用MLP算法进行比较
-    'OPEN_GAT': False,  # 启用GAT算法进行比较
+    'OPEN_GAT': True,  # 启用GAT算法进行比较
     'OPEN_HETERO': True,  # 启用异构图算法进行比较
     'DATA_AUGMENTATION': False,  # 是否启用数据增强
     'OPEN_LANDMARC': True,  # 启用LANDMARC算法进行比较
