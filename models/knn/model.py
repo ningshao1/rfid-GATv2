@@ -20,6 +20,7 @@ def knn_localization(features, labels, n_neighbors=7):
     返回:
         训练好的KNN模型
     """
+    features = features[:, :4]
     # 确保数据是numpy数组格式
     if isinstance(features, torch.Tensor):
         features = features.cpu().numpy()
@@ -45,6 +46,7 @@ def evaluate_knn_on_test_set(knn_model, test_features, test_labels):
     返回:
         平均误差距离
     """
+    test_features = test_features[:, :4]
     # 确保数据是numpy数组格式
     if isinstance(test_features, torch.Tensor):
         test_features = test_features.cpu().numpy()

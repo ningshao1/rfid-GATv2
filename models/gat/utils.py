@@ -214,11 +214,7 @@ def create_graph_data(localization, features_norm, labels_norm, k=None, pos=None
     import numpy as np
     from torch_geometric.data import Data
     adj_matrix = kneighbors_graph(
-        torch.as_tensor(
-            np.hstack([
-                0.2 * features_norm.cpu().numpy(), 0.8 * labels_norm.cpu().numpy()
-            ])
-        ),
+        torch.as_tensor(np.hstack([features_norm])),
         n_neighbors=k,
         mode='distance',
     )

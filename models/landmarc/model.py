@@ -23,6 +23,8 @@ def landmarc_localization(
     返回:
         预测位置和平均误差（如果提供真实位置）
     """
+    reference_features = reference_features[:, :4]
+    test_features = test_features[:, :4]
     # 确保数据是numpy数组格式
     if isinstance(reference_features, torch.Tensor):
         reference_features = reference_features.cpu().numpy()

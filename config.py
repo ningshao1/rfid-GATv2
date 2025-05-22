@@ -10,8 +10,8 @@ CONFIG = {
     'OPEN_KNN': True,  # 启用KNN算法进行比较
     'TRAIN_LOG': False,  # 启用训练日志
     'PREDICTION_LOG': False,  # 启用预测日志
-    'GRID_SEARCH': True,  # 是否启用网格搜索
-    'QUICK_SEARCH': False,  # 是否使用快速搜索（减少组合数量）
+    'GRID_SEARCH': False,  # 是否启用网格搜索
+    'QUICK_SEARCH': True,  # 是否使用快速搜索（减少组合数量）
     'OPEN_MLP': True,  # 启用MLP算法进行比较
     'OPEN_GAT': True,  # 启用GAT算法进行比较
     'OPEN_HETERO': True,  # 启用异构图算法进行比较
@@ -24,6 +24,40 @@ CONFIG = {
         [0.0, 10.0],  # 天线2 (0,10)
         [10.0, 0.0],  # 天线3 (10,0)
         [10.0, 10.0]  # 天线4 (10,10)
+    ],
+
+    # 椅子信息列表
+    'CHAIR_INFO': [
+        {
+            'type': '椅子',
+            'position': (6, 6),
+            'size': 0.8,
+            'material': 'wood'
+        },
+        {
+            'type': '桌子',
+            'position': (4, 4),
+            'size': 1.5,
+            'material': 'wood'
+        },
+        {
+            'type': '金属架',
+            'position': (8, 2),
+            'size': 1.2,
+            'material': 'metal'
+        },
+        {
+            'type': '电脑',
+            'position': (2, 7),
+            'size': 0.7,
+            'material': 'electronic'
+        },
+        {
+            'type': '柜子',
+            'position': (7, 8),
+            'size': 1.0,
+            'material': 'wood'
+        },
     ],
 
     # 数据文件路径

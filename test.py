@@ -322,39 +322,8 @@ class RFIDLocalization:
             ), self.device
         )
 
-        # 创建椅子信息列表
-        chair_info = [
-            {
-                'type': '椅子',
-                'position': (6, 6),
-                'size': 0.8,
-                'material': 'wood'
-            },
-            {
-                'type': '桌子',
-                'position': (4, 4),
-                'size': 1.5,
-                'material': 'wood'
-            },
-            {
-                'type': '金属架',
-                'position': (8, 2),
-                'size': 1.2,
-                'material': 'metal'
-            },
-            {
-                'type': '电脑',
-                'position': (2, 7),
-                'size': 0.7,
-                'material': 'electronic'
-            },
-            {
-                'type': '柜子',
-                'position': (7, 8),
-                'size': 1.0,
-                'material': 'wood'
-            },
-        ]
+        # 使用配置中的椅子信息列表
+        chair_info = self.config['CHAIR_INFO']
 
         # 添加边属性权重配置
         edge_attr_weights = self.config['EDGE_ATTR_WEIGHTS']
@@ -456,13 +425,8 @@ class RFIDLocalization:
 
             # 使用add_new_node_to_hetero_graph添加新节点
             # 首先创建初始异构图
-            # 添加椅子信息列表
-            chair_info = [{
-                'type': '椅子',
-                'position': (6, 6),
-                'size': 0.8,
-                'material': 'wood'
-            }]
+            # 使用配置中的椅子信息列表
+            chair_info = self.config['CHAIR_INFO']
 
             # 添加边属性权重配置
             edge_attr_weights = self.config['EDGE_ATTR_WEIGHTS']

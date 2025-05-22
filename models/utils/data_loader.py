@@ -33,6 +33,7 @@ def load_and_preprocess_test_data(test_csv_path, scaler_rssi=None, scaler_phase=
         ]].values,
         dtype=torch.float32
     )
+    # test_features[:, 4:8] = 0
     test_labels = torch.tensor(
         df_test[['true_x', 'true_y']].values, dtype=torch.float32
     )

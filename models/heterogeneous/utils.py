@@ -178,8 +178,8 @@ def create_hetero_graph_edges(
     # 使用特征和位置的组合来计算KNN
     combined_features = torch.cat(
         [
-            0.2 * tag_features,  # 给特征较小的权重
-            0.8 * tag_positions  # 给位置较大的权重
+            0.95 * tag_features,  # 给特征较小的权重
+            0.05 * tag_positions  # 给位置较大的权重
         ],
         dim=1
     ).cpu().numpy()
